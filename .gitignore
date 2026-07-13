@@ -216,3 +216,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# AI model files
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.safetensors
+
+# Local data
+data/
+datasets/
+
+# Logs
+logs/
+
+# Local environment files
+.env.*
+!.env.example
