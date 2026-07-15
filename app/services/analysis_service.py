@@ -1,12 +1,32 @@
+import os
+import boto3
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from app.schemas.analysis_schema import AICodeDetectionRequest, AICodeDetectionResponse
 
 # 1. 모델이 저장된 폴더 경로
 MODEL_PATH = "./app/models/codebart"
+MODEL_FILE = os.path.join(MODEL_PATH, "model.safetensors") 
+
+S3_BUCKET = "guardrail-codebert-models-v1"
+S3_KEY = "codebart/model.safetensors"
+AWS_REGION = "ap-southeast-1"
+
+def download_model_if_needed():
+    """로컬에 모델 파일이 없으면 S3에서 다운로드"""
+    if os.path.exists(MODEL_FILE):
+        print("모델이 이미 로컬에 존재합니다. 다운로드 스킵.")
+        return
+
+    print(f"모델 다운로드 중... (S3: {S3_BUCKET}/{S3_KEY})")
+    os.makedirs(MODEL_PATH, exist_ok=True)
+    s3 = boto3.client("s3", region_name=AWS_REGION)
+    s3.download_file(S3_BUCKET, S3_KEY, MODEL_FILE)
+    print("모델 다운로드 완료.")
 
 print("모델 업로드중")
 
+download_model_if_needed()
 # 모델 추론용 자료로 서버 처음 켜질 때 한 번 로드 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)

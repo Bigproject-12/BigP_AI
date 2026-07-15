@@ -1,1 +1,7 @@
 wheel==0.47.0
+boto3
+torch
+transformers
+fastapi
+uvicorn
+pydantic
