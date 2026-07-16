@@ -1,6 +1,9 @@
 import os
 import boto3
 import torch
+import tempfile   
+import subprocess  
+import json
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from app.schemas.analysis_schema import AICodeDetectionRequest, AICodeDetectionResponse
 
@@ -36,16 +39,62 @@ model.eval()
 
 print("완료")
 
+def run_semgrep(code_content: str) -> dict:
+    """코드를 임시 파일로 만들어 Semgrep으로 보안 취약점을 검사하는 함수"""
+    
+    # 1. 코드를 담을 임시 자바 파일 생성
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.java', delete=False, encoding='utf-8') as temp_file:
+        temp_file.write(code_content)
+        temp_file_path = temp_file.name
+
+    try:
+        # 2. Semgrep 실행
+        result = subprocess.run(
+            ['semgrep', '--config', 'p/java', '--json', temp_file_path],
+            capture_output=True,
+            text=True,
+            encoding='utf-8'
+        )
+        
+        # 3. 결과 파싱
+        output_data = json.loads(result.stdout)
+        results = output_data.get('results', [])
+        
+        # 4. 프론트엔드/스프링 전송용 데이터 정리
+        vulnerabilities = []
+        for item in results:
+            vulnerabilities.append({
+                "rule_id": item['check_id'],
+                "message": item['extra']['message'],
+                "line": item['start']['line']
+            })
+            
+        return {
+            "has_vulnerability": len(vulnerabilities) > 0,
+            "vulnerabilities": vulnerabilities
+        }
+        
+    except Exception as e:
+        print(f"Semgrep 실행 중 에러 발생: {e}")
+        return {"has_vulnerability": False, "vulnerabilities": []}
+        
+    finally:
+        # 5. 임시 파일 삭제
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
 
 async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResponse:
     # 스프링 부트(또는 포스트맨)에서 전달받은 원본 코드 내용
     code = request.code_content
     
+    security_report = run_semgrep(code)
+
     # max_length=512: 모델이 한 번에 읽을 수 있는 최대 길이로 커팅
     inputs = tokenizer(code, return_tensors="pt", truncation=True, max_length=512)
     
-    # 💡 4. AI 모델 추론 시작
-    with torch.no_grad(): # backpropagation(학습 역전파)을 막아서 메모리와 속도를 극대화합니다.
+    # 모델 추론 시작
+    with torch.no_grad(): 
         outputs = model(**inputs)
         
         # 로짓 값을 0.0 ~ 1.0 사이의 긍정/부정 확률로 변환
@@ -61,5 +110,7 @@ async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResp
     # 결과 반환 (DTO에 맞춰서 포장)
     return AICodeDetectionResponse(
         is_ai_generated=is_ai,
-        ai_probability=round(ai_prob, 2) # 소수점 둘째 자리까지만
+        ai_probability=round(ai_prob, 2),
+        has_vulnerability=security_report["has_vulnerability"],
+        vulnerabilities=security_report["vulnerabilities"]
     )
