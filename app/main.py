@@ -1,10 +1,23 @@
 from fastapi import FastAPI
 from app.api import analysis_router
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="BIGP AI 서버")
 
 # 라우터 등록 (주소가 http://localhost:8000/api/ai/detect 가 됩니다)
 app.include_router(analysis_router.router, prefix="/api/ai", tags=["AI Code Analysis"])
+
+origins = [
+    "http://localhost:5173",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def root():
