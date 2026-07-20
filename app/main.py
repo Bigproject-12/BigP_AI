@@ -1,11 +1,12 @@
 from fastapi import FastAPI
-from app.api import analysis_router
+from app.api import analysis_router, embedding_router
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="BIGP AI 서버")
 
-# 라우터 등록 (주소가 http://localhost:8000/api/ai/detect 가 됩니다)
+# 라우터 등록
 app.include_router(analysis_router.router, prefix="/api/ai", tags=["AI Code Analysis"])
+app.include_router(embedding_router.router, prefix="/api/embedding", tags=["Code Embedding"])
 
 origins = [
     "http://localhost:5173",
