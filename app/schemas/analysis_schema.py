@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 class AICodeDetectionRequest(BaseModel):
     code_content: str = Field(..., description="검증할 원본 코드 내용")
@@ -9,3 +9,7 @@ class AICodeDetectionResponse(BaseModel):
     ai_probability: float = Field(..., description="AI가 작성했을 확률 (0.0 ~ 100.0%)")
     has_vulnerability: bool
     vulnerabilities: List[Dict[str, Any]]
+    max_complexity: Optional[int] = 0
+    needs_refactoring: Optional[bool] = False
+    complexity_details: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="복잡도 임계치를 초과한 함수들의 상세 내역 (함수명, 점수, 라인, 메시지)")
+    patched_code: Optional[str] = None
