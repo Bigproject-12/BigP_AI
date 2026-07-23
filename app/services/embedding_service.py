@@ -104,5 +104,3 @@ def search_similar_code(repo_id: int, code: str, top_k: int = 5, threshold: floa
         if score >= threshold:
             results.append({"faiss_vector_id": int(vec_id), "similarity_score": float(score)})
     return results
-
-

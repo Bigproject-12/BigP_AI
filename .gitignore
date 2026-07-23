@@ -242,3 +242,5 @@ logs/
 
 # faiss_indexes 폴더 내의 모든 .index 파일 무시
 faiss_indexes/*.index
+
+"app/models/"
