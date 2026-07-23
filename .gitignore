@@ -243,4 +243,5 @@ logs/
 # faiss_indexes 폴더 내의 모든 .index 파일 무시
 faiss_indexes/*.index
 
+#모델 파일 안 올라가게
 "app/models/"
