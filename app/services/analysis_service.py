@@ -23,6 +23,22 @@ S3_BUCKET = "guardrail-codebert-models-v1"
 S3_KEY = "codebart/model.safetensors"
 AWS_REGION = "ap-southeast-1"
 
+# 언어별 Semgrep 룰셋 / 파일 확장자 매핑 (지원 언어 추가 시 여기에만 추가하면 됨)
+LANGUAGE_CONFIG = {
+    "java": {"semgrep_config": "p/java", "extension": ".java"},
+    "python": {"semgrep_config": "p/python", "extension": ".py"},
+    "javascript": {"semgrep_config": "p/javascript", "extension": ".js"},
+    "typescript": {"semgrep_config": "p/typescript", "extension": ".ts"},
+}
+DEFAULT_LANGUAGE = "java"
+
+
+def get_language_config(language: str) -> dict:
+    """지원하지 않는 언어가 들어와도 기본값(java)으로 안전하게 폴백"""
+    key = (language or DEFAULT_LANGUAGE).lower()
+    return LANGUAGE_CONFIG.get(key, LANGUAGE_CONFIG[DEFAULT_LANGUAGE])
+
+
 def download_model_if_needed():
     """로컬에 모델 파일이 없으면 S3에서 다운로드"""
     if os.path.exists(MODEL_FILE):
@@ -46,20 +62,21 @@ model.eval()
 
 print("완료")
 
-def generate_patched_code(original_code: str, vulnerabilities: list, needs_refactoring: bool = False, max_complexity: int = 0) -> str:
+def generate_patched_code(original_code: str, vulnerabilities: list, needs_refactoring: bool = False, max_complexity: int = 0, language: str = DEFAULT_LANGUAGE) -> str:
     
     refactoring_instruction = ""
     if needs_refactoring:
         refactoring_instruction = f"\n- [알고리즘 최적화]: 이 코드는 순환 복잡도가 {max_complexity}로 매우 높습니다. 불필요한 중첩 루프와 조건문을 제거하여 시간 복잡도를 줄이고 클린 코드로 리팩토링하세요."
 
     ticks = "`" * 3
+    lang_tag = (language or DEFAULT_LANGUAGE).lower()
 
     system_prompt = f"""
     당신은 세계 최고의 보안 코딩 및 알고리즘 최적화 전문가입니다.
     사용자가 코드를 주면, 보안 취약점을 해결하고 리팩토링한 완성본 코드를 제공해야 합니다.
     [절대 규칙]
     - 로직의 원래 의미(비즈니스 로직)는 절대 변경하지 말고 구조만 개선하세요.
-    - 코드는 반드시 마크다운 코드 블록({ticks}java 와 {ticks}) 안에 작성하세요.
+    - 코드는 반드시 마크다운 코드 블록({ticks}{lang_tag} 와 {ticks}) 안에 작성하세요.
     - 코드 블록 밖에는 어떠한 설명도 적지 마세요.
     """
 
@@ -91,14 +108,14 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
         
         raw_output = completion.choices[0].message.content.strip()
         
-        # 생성한 변수(ticks)를 이용해 정규식 패턴을 조립합니다.
-        pattern = ticks + r'(?:java|c|python)?\n(.*?)\n' + ticks
+        # 언어 태그를 옵션으로 처리 (java|python|c|javascript|typescript 등 전부 매칭)
+        pattern = ticks + r'(?:\w+)?\n(.*?)\n' + ticks
         match = re.search(pattern, raw_output, re.DOTALL)
         
         if match:
             final_code = match.group(1).strip()
         else:
-            final_code = raw_output.replace(ticks + "java", "").replace(ticks, "").strip()
+            final_code = raw_output.replace(ticks + lang_tag, "").replace(ticks, "").strip()
             
         return final_code
         
@@ -106,18 +123,20 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
         print(f"LLaMA API 호출 중 에러 발생: {e}")
         return "보완 코드 생성에 실패했습니다."
 
-def run_semgrep(code_content: str) -> dict:
+def run_semgrep(code_content: str, language: str = DEFAULT_LANGUAGE) -> dict:
     """코드를 임시 파일로 만들어 Semgrep으로 보안 취약점을 검사하는 함수"""
     
-    # 1. 코드를 담을 임시 자바 파일 생성
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.java', delete=False, encoding='utf-8') as temp_file:
+    lang_cfg = get_language_config(language)
+
+    # 1. 코드를 담을 임시 파일 생성 (언어별 확장자 적용)
+    with tempfile.NamedTemporaryFile(mode='w', suffix=lang_cfg["extension"], delete=False, encoding='utf-8') as temp_file:
         temp_file.write(code_content)
         temp_file_path = temp_file.name
 
     try:
-        # 2. Semgrep 실행
+        # 2. Semgrep 실행 (언어별 룰셋 적용)
         result = subprocess.run(
-            ['semgrep', '--config', 'p/java', '--json', temp_file_path],
+            ['semgrep', '--config', lang_cfg["semgrep_config"], '--json', temp_file_path],
             capture_output=True,
             text=True,
             encoding='utf-8'
@@ -151,10 +170,13 @@ def run_semgrep(code_content: str) -> dict:
             os.remove(temp_file_path)
 
 
-def analyze_complexity(code_content: str) -> dict:
+def analyze_complexity(code_content: str, language: str = DEFAULT_LANGUAGE) -> dict:
     """Lizard를 사용해 함수의 복잡도를 분석하고, 기준치를 초과한 함수의 상세 정보를 반환합니다."""
+    lang_cfg = get_language_config(language)
+    filename = "temp" + lang_cfg["extension"]
+
     try:
-        analysis = lizard.analyze_file.analyze_source_code("temp.java", code_content)
+        analysis = lizard.analyze_file.analyze_source_code(filename, code_content)
         
         if not analysis.function_list:
             return {"max_complexity": 0, "details": []}
@@ -184,10 +206,10 @@ def analyze_complexity(code_content: str) -> dict:
         return {"max_complexity": 0, "details": []}
 
 
-def run_security_pipeline(code: str) -> dict:
+def run_security_pipeline(code: str, language: str = DEFAULT_LANGUAGE) -> dict:
     
-    security_report = run_semgrep(code)
-    complexity_report = analyze_complexity(code)
+    security_report = run_semgrep(code, language)
+    complexity_report = analyze_complexity(code, language)
     
     max_complexity = complexity_report["max_complexity"]
     complexity_details = complexity_report["details"]
@@ -202,7 +224,8 @@ def run_security_pipeline(code: str) -> dict:
             code, 
             security_report["vulnerabilities"], 
             needs_refactoring, 
-            max_complexity
+            max_complexity,
+            language
         )
         
     return {
@@ -230,8 +253,9 @@ def run_ai_detection(code: str) -> dict:
 
 async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResponse:
     code = request.code_content
+    language = getattr(request, "language", None) or DEFAULT_LANGUAGE
 
-    security_task = asyncio.to_thread(run_security_pipeline, code)
+    security_task = asyncio.to_thread(run_security_pipeline, code, language)
     ai_task = asyncio.to_thread(run_ai_detection, code)
     
     security_result, ai_result = await asyncio.gather(security_task, ai_task)

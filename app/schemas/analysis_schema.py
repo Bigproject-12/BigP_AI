@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 
 class AICodeDetectionRequest(BaseModel):
     code_content: str = Field(..., description="검증할 원본 코드 내용")
+    language: str = Field(default="java", description="분석할 코드의 프로그래밍 언어 (java, python, javascript, typescript 등)")
 
 class AICodeDetectionResponse(BaseModel):
     is_ai_generated: bool = Field(..., description="AI가 작성했을 것으로 판단되는지 여부 (True/False)")
