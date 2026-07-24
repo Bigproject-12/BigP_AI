@@ -23,19 +23,28 @@ S3_BUCKET = "guardrail-codebert-models-v1"
 S3_KEY = "codebart/model.safetensors"
 AWS_REGION = "ap-southeast-1"
 
-# 언어별 Semgrep 룰셋 / 파일 확장자 매핑 (지원 언어 추가 시 여기에만 추가하면 됨)
 LANGUAGE_CONFIG = {
-    "java": {"semgrep_config": "p/java", "extension": ".java"},
-    "python": {"semgrep_config": "p/python", "extension": ".py"},
-    "javascript": {"semgrep_config": "p/javascript", "extension": ".js"},
-    "typescript": {"semgrep_config": "p/typescript", "extension": ".ts"},
+    "java": {"semgrep_configs": ["p/java"], "extension": ".java"},
+    "python": {"semgrep_configs": ["p/python", "./rules/custom_python_sqli.yaml"], "extension": ".py"},
+    "javascript": {"semgrep_configs": ["p/javascript"], "extension": ".js"},
+    "typescript": {"semgrep_configs": ["p/typescript"], "extension": ".ts"},
 }
+
+LANGUAGE_ALIASES = {
+    "py": "python",
+    "js": "javascript",
+    "jsx": "javascript",
+    "ts": "typescript",
+    "tsx": "typescript",
+    "java": "java",
+}
+
 DEFAULT_LANGUAGE = "java"
 
 
 def get_language_config(language: str) -> dict:
-    """지원하지 않는 언어가 들어와도 기본값(java)으로 안전하게 폴백"""
     key = (language or DEFAULT_LANGUAGE).lower()
+    key = LANGUAGE_ALIASES.get(key, key)   # 별칭이면 정식 이름으로 변환
     return LANGUAGE_CONFIG.get(key, LANGUAGE_CONFIG[DEFAULT_LANGUAGE])
 
 
@@ -128,25 +137,27 @@ def run_semgrep(code_content: str, language: str = DEFAULT_LANGUAGE) -> dict:
     
     lang_cfg = get_language_config(language)
 
-    # 1. 코드를 담을 임시 파일 생성 (언어별 확장자 적용)
     with tempfile.NamedTemporaryFile(mode='w', suffix=lang_cfg["extension"], delete=False, encoding='utf-8') as temp_file:
         temp_file.write(code_content)
         temp_file_path = temp_file.name
 
     try:
-        # 2. Semgrep 실행 (언어별 룰셋 적용)
+        # 여러 --config를 순서대로 명령어에 추가
+        cmd = ['semgrep']
+        for config in lang_cfg["semgrep_configs"]:
+            cmd += ['--config', config]
+        cmd += ['--json', temp_file_path]
+
         result = subprocess.run(
-            ['semgrep', '--config', lang_cfg["semgrep_config"], '--json', temp_file_path],
+            cmd,
             capture_output=True,
             text=True,
             encoding='utf-8'
         )
         
-        # 3. 결과 파싱
         output_data = json.loads(result.stdout)
         results = output_data.get('results', [])
         
-        # 4. 프론트엔드/스프링 전송용 데이터 정리
         vulnerabilities = []
         for item in results:
             vulnerabilities.append({
@@ -154,7 +165,8 @@ def run_semgrep(code_content: str, language: str = DEFAULT_LANGUAGE) -> dict:
                 "message": item['extra']['message'],
                 "line": item['start']['line']
             })
-            
+
+        vulnerabilities = translate_vulnerabilities_to_korean(vulnerabilities)
         return {
             "has_vulnerability": len(vulnerabilities) > 0,
             "vulnerabilities": vulnerabilities
@@ -165,7 +177,6 @@ def run_semgrep(code_content: str, language: str = DEFAULT_LANGUAGE) -> dict:
         return {"has_vulnerability": False, "vulnerabilities": []}
         
     finally:
-        # 5. 임시 파일 삭제
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
@@ -250,6 +261,44 @@ def run_ai_detection(code: str) -> dict:
         "is_ai_generated": is_ai,
         "ai_probability": round(ai_prob, 2)
     }
+
+def translate_vulnerabilities_to_korean(vulnerabilities: list) -> list:
+    """Semgrep 취약점 메시지만 한 번에 모아서 한국어로 번역 (Lizard는 이미 한국어라 대상 아님)"""
+    if not vulnerabilities:
+        return vulnerabilities
+
+    joined = "\n---\n".join(v["message"] for v in vulnerabilities)
+
+    try:
+        completion = client.chat.completions.create(
+            model="meta/llama-3.1-8b-instruct",
+            messages=[
+                {"role": "system", "content": (
+                    "당신은 보안 취약점 설명 번역가입니다. "
+                    "입력된 여러 문장은 '---'로 구분되어 있습니다. "
+                    "각 문장을 자연스러운 한국어로 번역하세요. "
+                    "코드 식별자, 함수명, 라이브러리명(예: MD5, SHA256, subprocess)은 번역하지 말고 그대로 두세요. "
+                    "번역 결과만 입력과 동일한 개수로, 동일하게 '---'로 구분해서 출력하세요. 다른 설명은 붙이지 마세요."
+                )},
+                {"role": "user", "content": joined}
+            ],
+            temperature=0.1,
+            top_p=0.1,
+            max_tokens=1024,
+            stream=False
+        )
+        translated_joined = completion.choices[0].message.content.strip()
+        translated_list = [t.strip() for t in translated_joined.split("---")]
+
+        if len(translated_list) == len(vulnerabilities):
+            for v, translated in zip(vulnerabilities, translated_list):
+                v["message"] = translated
+        else:
+            print("번역 결과 개수 불일치, 원문 유지")
+    except Exception as e:
+        print(f"취약점 메시지 번역 중 에러 발생: {e}")
+
+    return vulnerabilities
 
 async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResponse:
     code = request.code_content
