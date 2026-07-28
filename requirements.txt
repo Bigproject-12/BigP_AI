@@ -6,3 +6,4 @@ fastapi
 uvicorn
 pydantic
 faiss-cpu==1.8.0
+tree-sitter-language-pack
