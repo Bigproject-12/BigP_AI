@@ -24,3 +24,11 @@ class SearchDuplicateRequest(BaseModel):
 
 class SearchDuplicateResponse(BaseModel):
     duplicates: List[Dict[str, Any]] = Field(..., description="유사 코드 청크 목록 (faiss_vector_id, similarity_score)")
+
+class RemoveVectorsRequest(BaseModel):
+    repo_id: int = Field(..., description="벡터를 지울 대상 레포의 repo_id")
+    vector_ids: List[int] = Field(..., description="FAISS 인덱스에서 제거할 벡터 ID 목록")
+
+
+class RemoveVectorsResponse(BaseModel):
+    removed_count: int = Field(..., description="실제로 제거된 벡터 개수")

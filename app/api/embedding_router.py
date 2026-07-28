@@ -1,9 +1,10 @@
 from fastapi import APIRouter
 from app.schemas.embedding_schema import (
     IndexRepoRequest, IndexRepoResponse,
-    SearchDuplicateRequest, SearchDuplicateResponse
+    SearchDuplicateRequest, SearchDuplicateResponse,
+    RemoveVectorsRequest, RemoveVectorsResponse,
 )
-from app.services.embedding_service import index_repo_files, search_similar_code
+from app.services.embedding_service import index_repo_files, search_similar_code, remove_vectors 
 
 router = APIRouter()
 
@@ -17,3 +18,8 @@ async def index_repo(request: IndexRepoRequest):
 async def search_duplicates(request: SearchDuplicateRequest):
     results = search_similar_code(request.repo_id, request.code_content)
     return SearchDuplicateResponse(duplicates=results)
+
+@router.post("/remove", response_model=RemoveVectorsResponse)
+async def remove_vectors_endpoint(request: RemoveVectorsRequest):
+    removed_count = remove_vectors(request.repo_id, request.vector_ids)
+    return RemoveVectorsResponse(removed_count=removed_count)

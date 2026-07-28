@@ -15,7 +15,6 @@ client = OpenAI(
   base_url = "https://integrate.api.nvidia.com/v1",
   api_key = "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" 
 )
-# 1. 모델이 저장된 폴더 경로
 MODEL_PATH = "./app/models/codebart"
 MODEL_FILE = os.path.join(MODEL_PATH, "model.safetensors") 
 
@@ -44,7 +43,7 @@ DEFAULT_LANGUAGE = "java"
 
 def get_language_config(language: str) -> dict:
     key = (language or DEFAULT_LANGUAGE).lower()
-    key = LANGUAGE_ALIASES.get(key, key)   # 별칭이면 정식 이름으로 변환
+    key = LANGUAGE_ALIASES.get(key, key)
     return LANGUAGE_CONFIG.get(key, LANGUAGE_CONFIG[DEFAULT_LANGUAGE])
 
 
@@ -61,21 +60,76 @@ def download_model_if_needed():
     print("모델 다운로드 완료.")
 
 print("모델 업로드중")
-
 download_model_if_needed()
-# 모델 추론용 자료로 서버 처음 켜질 때 한 번 로드 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
-
 model.eval()
-
 print("완료")
 
-def generate_patched_code(original_code: str, vulnerabilities: list, needs_refactoring: bool = False, max_complexity: int = 0, language: str = DEFAULT_LANGUAGE) -> str:
+
+def translate_vulnerabilities_to_korean(vulnerabilities: list) -> list:
+    """Semgrep 취약점 메시지만 한 번에 모아서 한국어로 번역 (Lizard는 이미 한국어라 대상 아님)"""
+    if not vulnerabilities:
+        return vulnerabilities
+
+    joined = "\n---\n".join(v["message"] for v in vulnerabilities)
+
+    try:
+        completion = client.chat.completions.create(
+            model="meta/llama-3.1-8b-instruct",
+            messages=[
+                {"role": "system", "content": (
+                    "당신은 보안 취약점 설명 번역가입니다. "
+                    "입력된 여러 문장은 '---'로 구분되어 있습니다. "
+                    "각 문장을 자연스러운 한국어로 번역하세요. "
+                    "코드 식별자, 함수명, 라이브러리명(예: MD5, SHA256, subprocess)은 번역하지 말고 그대로 두세요. "
+                    "번역 결과만 입력과 동일한 개수로, 동일하게 '---'로 구분해서 출력하세요. 다른 설명은 붙이지 마세요."
+                )},
+                {"role": "user", "content": joined}
+            ],
+            temperature=0.1,
+            top_p=0.1,
+            max_tokens=1024,
+            stream=False
+        )
+        translated_joined = completion.choices[0].message.content.strip()
+        translated_list = [t.strip() for t in translated_joined.split("---")]
+
+        if len(translated_list) == len(vulnerabilities):
+            for v, translated in zip(vulnerabilities, translated_list):
+                v["message"] = translated
+        else:
+            print("번역 결과 개수 불일치, 원문 유지")
+    except Exception as e:
+        print(f"취약점 메시지 번역 중 에러 발생: {e}")
+
+    return vulnerabilities
+
+
+def generate_patched_code(original_code: str, vulnerabilities: list, needs_refactoring: bool = False, 
+                           max_complexity: int = 0, language: str = DEFAULT_LANGUAGE,
+                           duplicate_snippets: list = None) -> str:
     
     refactoring_instruction = ""
     if needs_refactoring:
         refactoring_instruction = f"\n- [알고리즘 최적화]: 이 코드는 순환 복잡도가 {max_complexity}로 매우 높습니다. 불필요한 중첩 루프와 조건문을 제거하여 시간 복잡도를 줄이고 클린 코드로 리팩토링하세요."
+
+    duplicate_instruction = ""
+    if duplicate_snippets:
+        snippets_text = "\n\n".join(
+            f"[유사도 {d.get('similarity_score', 0):.2f}, 위치: {d.get('file_path')} "
+            f"({d.get('start_line')}~{d.get('end_line')}줄), 함수명: {d.get('function_name')}, "
+            f"매개변수: {', '.join(d.get('parameters') or [])}]\n{d.get('code')}"
+            for d in duplicate_snippets[:2]
+        )
+        duplicate_instruction = f"""
+    - [코드 재사용]: 아래는 이 프로젝트에 이미 존재하는 유사한 함수입니다.
+      가능하다면 원본 코드에서 중복되는 함수 정의를 제거하고, 아래 기존 함수를 import(또는 참조)하여
+      호출하는 방식으로 리팩토링하세요. 함수명과 매개변수 순서를 정확히 맞추세요.
+      기존 로직의 실제 동작 방식은 절대 변경하지 마세요.
+
+      {snippets_text}
+    """
 
     ticks = "`" * 3
     lang_tag = (language or DEFAULT_LANGUAGE).lower()
@@ -94,7 +148,7 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
     {json.dumps(vulnerabilities, ensure_ascii=False, indent=2)}
     
     [수정 요청 사항]
-    - 발견된 보안 취약점(SQL Injection 등)을 완벽하게 패치하세요.{refactoring_instruction}
+    - 발견된 보안 취약점(SQL Injection 등)을 완벽하게 패치하세요.{refactoring_instruction}{duplicate_instruction}
     
     [원본 코드]
     {original_code}
@@ -102,7 +156,13 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
 
     try:
         print("LLaMA 보완코드 생성 시작")
-        
+        estimated_code_tokens = max(1, len(original_code) // 3)
+        expected_output_tokens = int(estimated_code_tokens * 1.3) + 512
+
+        sample_max_tokens =  max(1024, min(expected_output_tokens, 8192))
+        print(len(original_code))
+        print("나눈 값: ",len(original_code) // 1024)
+        print("현제 max 토큰:",sample_max_tokens)
         completion = client.chat.completions.create(
           model="meta/llama-3.1-8b-instruct",
           messages=[
@@ -111,26 +171,24 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
           ], 
           temperature=0.1,
           top_p=0.1,
-          max_tokens=2048,
+          max_tokens = sample_max_tokens,
           stream=False
         )
-        
         raw_output = completion.choices[0].message.content.strip()
-        
-        # 언어 태그를 옵션으로 처리 (java|python|c|javascript|typescript 등 전부 매칭)
         pattern = ticks + r'(?:\w+)?\n(.*?)\n' + ticks
         match = re.search(pattern, raw_output, re.DOTALL)
-        
+
         if match:
             final_code = match.group(1).strip()
         else:
             final_code = raw_output.replace(ticks + lang_tag, "").replace(ticks, "").strip()
-            
+
         return final_code
-        
+
     except Exception as e:
         print(f"LLaMA API 호출 중 에러 발생: {e}")
         return "보완 코드 생성에 실패했습니다."
+
 
 def run_semgrep(code_content: str, language: str = DEFAULT_LANGUAGE) -> dict:
     """코드를 임시 파일로 만들어 Semgrep으로 보안 취약점을 검사하는 함수"""
@@ -142,19 +200,12 @@ def run_semgrep(code_content: str, language: str = DEFAULT_LANGUAGE) -> dict:
         temp_file_path = temp_file.name
 
     try:
-        # 여러 --config를 순서대로 명령어에 추가
         cmd = ['semgrep']
         for config in lang_cfg["semgrep_configs"]:
             cmd += ['--config', config]
         cmd += ['--json', temp_file_path]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding='utf-8'
-        )
-        
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
         output_data = json.loads(result.stdout)
         results = output_data.get('results', [])
         
@@ -217,7 +268,7 @@ def analyze_complexity(code_content: str, language: str = DEFAULT_LANGUAGE) -> d
         return {"max_complexity": 0, "details": []}
 
 
-def run_security_pipeline(code: str, language: str = DEFAULT_LANGUAGE) -> dict:
+def run_security_pipeline(code: str, language: str = DEFAULT_LANGUAGE, duplicate_snippets: list = None) -> dict:
     
     security_report = run_semgrep(code, language)
     complexity_report = analyze_complexity(code, language)
@@ -230,13 +281,14 @@ def run_security_pipeline(code: str, language: str = DEFAULT_LANGUAGE) -> dict:
     
     patched_code_result = None
     
-    if security_report["has_vulnerability"] or needs_refactoring:
+    if security_report["has_vulnerability"] or needs_refactoring or duplicate_snippets:
         patched_code_result = generate_patched_code(
             code, 
             security_report["vulnerabilities"], 
             needs_refactoring, 
             max_complexity,
-            language
+            language,
+            duplicate_snippets
         )
         
     return {
@@ -247,6 +299,7 @@ def run_security_pipeline(code: str, language: str = DEFAULT_LANGUAGE) -> dict:
         "complexity_details": complexity_details,  
         "patched_code": patched_code_result
     }
+
 
 def run_ai_detection(code: str) -> dict:
     """AI 모델을 돌려 확률을 계산하는 묶음 함수"""
@@ -262,49 +315,15 @@ def run_ai_detection(code: str) -> dict:
         "ai_probability": round(ai_prob, 2)
     }
 
-def translate_vulnerabilities_to_korean(vulnerabilities: list) -> list:
-    """Semgrep 취약점 메시지만 한 번에 모아서 한국어로 번역 (Lizard는 이미 한국어라 대상 아님)"""
-    if not vulnerabilities:
-        return vulnerabilities
-
-    joined = "\n---\n".join(v["message"] for v in vulnerabilities)
-
-    try:
-        completion = client.chat.completions.create(
-            model="meta/llama-3.1-8b-instruct",
-            messages=[
-                {"role": "system", "content": (
-                    "당신은 보안 취약점 설명 번역가입니다. "
-                    "입력된 여러 문장은 '---'로 구분되어 있습니다. "
-                    "각 문장을 자연스러운 한국어로 번역하세요. "
-                    "코드 식별자, 함수명, 라이브러리명(예: MD5, SHA256, subprocess)은 번역하지 말고 그대로 두세요. "
-                    "번역 결과만 입력과 동일한 개수로, 동일하게 '---'로 구분해서 출력하세요. 다른 설명은 붙이지 마세요."
-                )},
-                {"role": "user", "content": joined}
-            ],
-            temperature=0.1,
-            top_p=0.1,
-            max_tokens=1024,
-            stream=False
-        )
-        translated_joined = completion.choices[0].message.content.strip()
-        translated_list = [t.strip() for t in translated_joined.split("---")]
-
-        if len(translated_list) == len(vulnerabilities):
-            for v, translated in zip(vulnerabilities, translated_list):
-                v["message"] = translated
-        else:
-            print("번역 결과 개수 불일치, 원문 유지")
-    except Exception as e:
-        print(f"취약점 메시지 번역 중 에러 발생: {e}")
-
-    return vulnerabilities
 
 async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResponse:
     code = request.code_content
     language = getattr(request, "language", None) or DEFAULT_LANGUAGE
 
-    security_task = asyncio.to_thread(run_security_pipeline, code, language)
+    # Spring이 이미 검색/보강해서 넘겨준 값을 그대로 사용 (FastAPI가 직접 검색하지 않음)
+    duplicate_snippets = [d.model_dump() for d in (request.duplicate_snippets or [])]
+
+    security_task = asyncio.to_thread(run_security_pipeline, code, language, duplicate_snippets)
     ai_task = asyncio.to_thread(run_ai_detection, code)
     
     security_result, ai_result = await asyncio.gather(security_task, ai_task)
@@ -316,6 +335,6 @@ async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResp
         vulnerabilities=security_result["vulnerabilities"],
         max_complexity=security_result["max_complexity"],
         needs_refactoring=security_result["needs_refactoring"],
-        complexity_details=security_result.get("complexity_details", []),  
+        complexity_details=security_result.get("complexity_details", []),
         patched_code=security_result["patched_code"]
     )
