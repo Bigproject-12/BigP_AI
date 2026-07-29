@@ -205,24 +205,24 @@ def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, c
         issues_text = "\n(특별히 발견된 취약점이나 비효율 이슈는 없었습니다. 다만 일반적인 코드 품질 관점에서 프롬프트를 다듬어주세요.)\n"
 
     system_prompt = """
-당신은 프롬프트 엔지니어링 전문가입니다.
-사용자가 AI에게 코드 생성을 요청했던 "원본 프롬프트"와, 그 결과로 생성된 코드에서 발견된 문제점을 받게 됩니다.
-같은 목적(기능)을 달성하되, 발견된 문제가 재발하지 않도록 프롬프트를 재작성해야 합니다.
+    당신은 프롬프트 엔지니어링 전문가입니다.
+    사용자가 AI에게 코드 생성을 요청했던 "원본 프롬프트"와, 그 결과로 생성된 코드에서 발견된 문제점을 받게 됩니다.
+    같은 목적(기능)을 달성하되, 발견된 문제가 재발하지 않도록 프롬프트를 재작성해야 합니다.
 
-[절대 규칙]
-- 원본 프롬프트의 핵심 목적/기능 요구사항은 절대 바꾸지 마세요.
-- "안전하게", "적절히", "올바르게", "효율적으로" 같은 추상적이고 모호한 표현은 절대 사용하지 마세요.
-- 반드시 구체적인 기술 용어/기법명을 직접 명시하세요.
-- **입력된 문제점 목록(취약점 + 복잡도) 각각에 대해, 빠짐없이 하나씩 프롬프트 본문에 구체적인 지시 문장을 추가하세요.
-  일부만 반영하고 나머지를 설명(explanation)에서만 언급하는 것은 금지합니다.**
-- **비밀값/키를 환경변수 등으로 옮기라고 지시할 때는, "값이 없을 경우 기본값을 하드코딩하지 말고 
-  에러를 발생시키거나 실행을 중단하라"는 지시도 함께 포함하세요.**
-- 반드시 다음 형식으로만 응답하세요:
-[PROMPT]
-(재구성된 프롬프트 전체)
-[EXPLANATION]
-(어떤 부분을 왜 추가/수정했는지 2~3문장으로 설명)
-"""
+    [절대 규칙]
+    - 원본 프롬프트의 핵심 목적/기능 요구사항은 절대 바꾸지 마세요.
+    - "안전하게", "적절히", "올바르게", "효율적으로" 같은 추상적이고 모호한 표현은 절대 사용하지 마세요.
+    - 반드시 구체적인 기술 용어/기법명을 직접 명시하세요.
+    - 입력으로 주어진 [발견된 문제점] 목록에 있는 항목만 반영하세요. 코드를 보고 스스로 판단하여
+      목록에 없는 새로운 문제를 추가로 지적하거나 프롬프트에 반영하지 마세요.
+    - 제안하는 해결 기법이 실제로 그 문제를 해결하는지 스스로 검증하세요.
+      (예: pickle.load()와 pickle.loads()는 둘 다 동일하게 안전하지 않으므로,
+      이런 식으로 문제를 우회하는 것처럼 보이지만 실제로는 해결되지 않는 기법을 제안하지 마세요.)
+    - 입력된 문제점 목록 각각에 대해, 빠짐없이 하나씩 프롬프트 본문에 구체적인 지시 문장을 추가하세요.
+    - 절대 다른 설명, 코드 예시, 마크다운 코드 블록을 포함하지 마세요.
+    - 반드시 아래와 같은 순수 JSON 형식으로만 응답하세요. JSON 앞뒤에 어떤 텍스트도, 백틱도 붙이지 마세요:
+    {"reconstructed_prompt": "재구성된 프롬프트 전체 문자열", "explanation": "어떤 부분을 왜 추가/수정했는지 2~3문장 설명"}
+    """
 
     user_prompt = f"""
     [원본 프롬프트]
@@ -234,7 +234,8 @@ def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, c
     [이 코드에서 발견된 문제점]
     {issues_text}
 
-    위 문제가 재발하지 않도록, 원본 프롬프트를 재구성해주세요.
+    위 문제가 재발하지 않도록, 구체적인 기법을 명시해서 원본 프롬프트를 재구성해주세요.
+    반드시 JSON 형식으로만 응답하세요.
     """
 
     try:
@@ -251,15 +252,20 @@ def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, c
         )
         raw_output = completion.choices[0].message.content.strip()
 
-        prompt_match = re.search(r'\[PROMPT\]\s*(.*?)\s*\[EXPLANATION\]', raw_output, re.DOTALL)
-        explanation_match = re.search(r'\[EXPLANATION\]\s*(.*)', raw_output, re.DOTALL)
-
-        reconstructed_prompt = prompt_match.group(1).strip() if prompt_match else raw_output
-        explanation = explanation_match.group(1).strip() if explanation_match else ""
+        # 1차 시도: 전체를 JSON으로 바로 파싱
+        try:
+            parsed = json.loads(raw_output)
+        except json.JSONDecodeError:
+            # 2차 시도: 앞뒤에 잡텍스트/마크다운이 섞였을 경우, { }로 감싸인 부분만 추출
+            match = re.search(r'\{.*\}', raw_output, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group(0))
+            else:
+                raise
 
         return {
-            "reconstructed_prompt": reconstructed_prompt,
-            "explanation": explanation
+            "reconstructed_prompt": parsed.get("reconstructed_prompt", original_prompt),
+            "explanation": parsed.get("explanation", "")
         }
 
     except Exception as e:
