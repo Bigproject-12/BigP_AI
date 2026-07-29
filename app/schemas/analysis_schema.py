@@ -30,3 +30,14 @@ class AICodeDetectionResponse(BaseModel):
     needs_refactoring: Optional[bool] = False
     complexity_details: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="복잡도 임계치를 초과한 함수들의 상세 내역 (함수명, 점수, 라인, 메시지)")
     patched_code: Optional[str] = None
+
+class PromptReconstructRequest(BaseModel):
+    original_prompt: str = Field(..., description="사용자가 이 코드를 생성할 때 실제로 사용한 프롬프트")
+    code_content: str = Field(..., description="그 프롬프트로 생성된 원본 코드")
+    vulnerabilities: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="이 코드에서 발견된 보안 취약점 목록")
+    complexity_details: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="이 코드에서 발견된 복잡도/비효율 이슈 목록")
+
+
+class PromptReconstructResponse(BaseModel):
+    reconstructed_prompt: str = Field(..., description="문제점이 반영되어 재구성된 프롬프트")
+    explanation: str = Field(..., description="어떤 부분을 왜 개선했는지에 대한 설명")

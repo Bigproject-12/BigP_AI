@@ -6,7 +6,7 @@ import subprocess
 import json
 import asyncio
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from app.schemas.analysis_schema import AICodeDetectionRequest, AICodeDetectionResponse
+from app.schemas.analysis_schema import AICodeDetectionRequest, AICodeDetectionResponse, PromptReconstructRequest, PromptReconstructResponse
 from openai import OpenAI
 import lizard
 import re
@@ -188,6 +188,99 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
     except Exception as e:
         print(f"LLaMA API 호출 중 에러 발생: {e}")
         return "보완 코드 생성에 실패했습니다."
+
+
+def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, complexity_details: list) -> dict:
+    """사용자의 원본 프롬프트를, 발견된 문제점이 재발하지 않도록 재구성"""
+
+    issues_text = ""
+    if vulnerabilities:
+        vuln_list = "\n".join(f"- {v.get('message', '')}" for v in vulnerabilities[:5])
+        issues_text += f"\n[발견된 보안 취약점]\n{vuln_list}\n"
+    if complexity_details:
+        comp_list = "\n".join(f"- {c.get('message', '')}" for c in complexity_details[:5])
+        issues_text += f"\n[발견된 복잡도/비효율 이슈]\n{comp_list}\n"
+
+    if not issues_text:
+        issues_text = "\n(특별히 발견된 취약점이나 비효율 이슈는 없었습니다. 다만 일반적인 코드 품질 관점에서 프롬프트를 다듬어주세요.)\n"
+
+    system_prompt = """
+당신은 프롬프트 엔지니어링 전문가입니다.
+사용자가 AI에게 코드 생성을 요청했던 "원본 프롬프트"와, 그 결과로 생성된 코드에서 발견된 문제점을 받게 됩니다.
+같은 목적(기능)을 달성하되, 발견된 문제가 재발하지 않도록 프롬프트를 재작성해야 합니다.
+
+[절대 규칙]
+- 원본 프롬프트의 핵심 목적/기능 요구사항은 절대 바꾸지 마세요.
+- "안전하게", "적절히", "올바르게", "효율적으로" 같은 추상적이고 모호한 표현은 절대 사용하지 마세요.
+- 반드시 구체적인 기술 용어/기법명을 직접 명시하세요.
+- **입력된 문제점 목록(취약점 + 복잡도) 각각에 대해, 빠짐없이 하나씩 프롬프트 본문에 구체적인 지시 문장을 추가하세요.
+  일부만 반영하고 나머지를 설명(explanation)에서만 언급하는 것은 금지합니다.**
+- **비밀값/키를 환경변수 등으로 옮기라고 지시할 때는, "값이 없을 경우 기본값을 하드코딩하지 말고 
+  에러를 발생시키거나 실행을 중단하라"는 지시도 함께 포함하세요.**
+- 반드시 다음 형식으로만 응답하세요:
+[PROMPT]
+(재구성된 프롬프트 전체)
+[EXPLANATION]
+(어떤 부분을 왜 추가/수정했는지 2~3문장으로 설명)
+"""
+
+    user_prompt = f"""
+    [원본 프롬프트]
+    {original_prompt}
+
+    [그 프롬프트로 생성된 코드]
+    {code}
+
+    [이 코드에서 발견된 문제점]
+    {issues_text}
+
+    위 문제가 재발하지 않도록, 원본 프롬프트를 재구성해주세요.
+    """
+
+    try:
+        completion = client.chat.completions.create(
+            model="meta/llama-3.1-8b-instruct",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.2,
+            top_p=0.2,
+            max_tokens=2048,
+            stream=False
+        )
+        raw_output = completion.choices[0].message.content.strip()
+
+        prompt_match = re.search(r'\[PROMPT\]\s*(.*?)\s*\[EXPLANATION\]', raw_output, re.DOTALL)
+        explanation_match = re.search(r'\[EXPLANATION\]\s*(.*)', raw_output, re.DOTALL)
+
+        reconstructed_prompt = prompt_match.group(1).strip() if prompt_match else raw_output
+        explanation = explanation_match.group(1).strip() if explanation_match else ""
+
+        return {
+            "reconstructed_prompt": reconstructed_prompt,
+            "explanation": explanation
+        }
+
+    except Exception as e:
+        print(f"프롬프트 재구성 중 에러 발생: {e}")
+        return {
+            "reconstructed_prompt": original_prompt,
+            "explanation": "프롬프트 재구성에 실패하여 원본 프롬프트를 그대로 반환합니다."
+        }
+
+
+async def reconstruct_prompt_endpoint(request: PromptReconstructRequest) -> PromptReconstructResponse:
+    result = reconstruct_prompt(
+        request.original_prompt,
+        request.code_content,
+        request.vulnerabilities,
+        request.complexity_details
+    )
+    return PromptReconstructResponse(
+        reconstructed_prompt=result["reconstructed_prompt"],
+        explanation=result["explanation"]
+    )
 
 
 def run_semgrep(code_content: str, language: str = DEFAULT_LANGUAGE) -> dict:
