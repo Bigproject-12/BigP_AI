@@ -7,15 +7,15 @@ from transformers import AutoTokenizer, AutoModel
 from tree_sitter_language_pack import get_parser
 from tree_sitter import Query, QueryCursor
 
-EMBED_MODEL_PATH = "./app/models/codebert-base" # 모델 경로
-FAISS_INDEX_DIR = "./app/faiss_indexes" # 임베딩 파일 경로
-DIMENSION = 768 # CODE BERT 모델이 처리할 수 있는 차원 고정값
+EMBED_MODEL_PATH = "./app/models/codesage-small"   # 경로 변경
+FAISS_INDEX_DIR = "./app/faiss_indexes"
+DIMENSION = 1024   # 768 → 1024로 변경
 
-embed_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH) # 코드를 모델이 이해하기 위한 토큰으로 변환하기 위한 도구
-embed_model = AutoModel.from_pretrained(EMBED_MODEL_PATH) # 가중치
-embed_model.eval() # 학습이 아닌 추론을 하기 위한 작업 학습엔 .train 으로 사용
+embed_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH, trust_remote_code=True)
+embed_model = AutoModel.from_pretrained(EMBED_MODEL_PATH, trust_remote_code=True)
+embed_model.eval()
 
-os.makedirs(FAISS_INDEX_DIR, exist_ok=True) # 파일 경로가 없으면 만들기 위함
+os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
 print("임베딩 모델 로딩 완료")
 
 
@@ -147,16 +147,19 @@ def chunk_code_by_function(code_content: str, file_path: str, language: str) -> 
     return chunks
 
 
+MIN_CHUNK_LENGTH = 30
+
 def chunk_code_smart(code_content: str, file_path: str, language: str) -> list[dict]:
-    """언어에 따라 함수 단위 청킹 또는 슬라이딩 윈도우 청킹을 선택"""
     if language in TREE_SITTER_QUERY_PATTERNS:
         try:
-            return chunk_code_by_function(code_content, file_path, language)
+            chunks = chunk_code_by_function(code_content, file_path, language)
         except Exception as e:
             print(f"{language} 함수 단위 파싱 실패, 슬라이딩 윈도우로 폴백: {e}")
-            return chunk_code(code_content, file_path)
+            chunks = chunk_code(code_content, file_path)
     else:
-        return chunk_code(code_content, file_path)
+        chunks = chunk_code(code_content, file_path)
+
+    return [c for c in chunks if len(c["code"].strip()) >= MIN_CHUNK_LENGTH]
 
 
 def _index_path(repo_id: int) -> str:
@@ -200,7 +203,7 @@ def index_repo_files(repo_id: int, files: list[dict]) -> list[dict]:
     return metadata_result
 
 
-def search_similar_code(repo_id: int, code: str, top_k: int = 5, threshold: float = 0.85) -> list[dict]:
+def search_similar_code(repo_id: int, code: str, top_k: int = 5, threshold: float = 0.78) -> list[dict]:
     path = _index_path(repo_id)
     if not os.path.exists(path):
         return []
