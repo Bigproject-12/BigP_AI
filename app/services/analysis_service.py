@@ -159,7 +159,7 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
         estimated_code_tokens = max(1, len(original_code) // 3)
         expected_output_tokens = int(estimated_code_tokens * 1.3) + 512
 
-        sample_max_tokens =  max(1024, min(expected_output_tokens, 8192))
+        sample_max_tokens =  max(2048, min(expected_output_tokens, 8192))
         print(len(original_code))
         print("나눈 값: ",len(original_code) // 1024)
         print("현제 max 토큰:",sample_max_tokens)
@@ -320,8 +320,12 @@ async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResp
     code = request.code_content
     language = getattr(request, "language", None) or DEFAULT_LANGUAGE
 
+    print(f"[DEBUG] 받은 duplicate_snippets: {request.duplicate_snippets}")
+
     # Spring이 이미 검색/보강해서 넘겨준 값을 그대로 사용 (FastAPI가 직접 검색하지 않음)
     duplicate_snippets = [d.model_dump() for d in (request.duplicate_snippets or [])]
+
+    print(f"[DEBUG] 변환된 duplicate_snippets: {duplicate_snippets}")
 
     security_task = asyncio.to_thread(run_security_pipeline, code, language, duplicate_snippets)
     ai_task = asyncio.to_thread(run_ai_detection, code)
