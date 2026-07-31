@@ -1,0 +1,38 @@
+rules:
+  - id: guardrail-cpp-command-injection
+    languages: [cpp]
+    severity: ERROR
+    message: >
+      system() or popen() is called with a dynamically built command string, not a
+      hardcoded literal. This may lead to Command Injection. Validate/sanitize
+      input or avoid shell invocation entirely.
+    patterns:
+      - pattern-either:
+          - pattern: system($CMD)
+          - pattern: popen($CMD, ...)
+      - pattern-not: system("...")
+      - pattern-not: popen("...", ...)
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+      owasp: "A03:2021 - Injection"
+
+  - id: guardrail-cpp-hardcoded-secret
+    languages: [cpp]
+    severity: ERROR
+    message: >
+      Sensitive value appears to be hardcoded as a string literal. This may lead to
+      credential leakage if the source/binary is exposed. Load this value from an
+      environment variable or a secret manager instead of hardcoding it.
+    patterns:
+      - pattern-either:
+          - pattern: std::string $NAME = "...";
+          - pattern: const std::string $NAME = "...";
+          - pattern: const char *$NAME = "...";
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(secret|password|api_key|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"

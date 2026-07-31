@@ -1,0 +1,51 @@
+rules:
+  - id: guardrail-csharp-sqli-dynamic-execute
+    languages: [csharp]
+    severity: ERROR
+    message: >
+      SqlCommand is executed with a dynamically built query string, not a hardcoded
+      literal. This may lead to SQL Injection. Use parameterized queries with
+      SqlParameter instead (e.g. cmd.Parameters.AddWithValue(...)).
+    patterns:
+      - pattern-either:
+          - pattern: new SqlCommand($QUERY, ...)
+      - pattern-not: new SqlCommand("...", ...)
+    metadata:
+      category: security
+      cwe: "CWE-89: SQL Injection"
+      owasp: "A03:2021 - Injection"
+
+  - id: guardrail-csharp-hardcoded-secret
+    languages: [csharp]
+    severity: ERROR
+    message: >
+      Sensitive value appears to be hardcoded as a string literal. This may lead to
+      credential leakage if the source code is exposed. Load this value from an
+      environment variable or a secret manager instead of hardcoding it.
+    patterns:
+      - pattern-either:
+          - pattern: private const string $NAME = "...";
+          - pattern: static readonly string $NAME = "...";
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(secret|password|api_key|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+
+  - id: guardrail-csharp-reflected-xss
+    languages: [csharp]
+    severity: ERROR
+    message: >
+      User input is concatenated directly into an HTTP response without encoding.
+      This may lead to Reflected XSS. Use HttpUtility.HtmlEncode() or a templating
+      engine with auto-encoding instead of raw string concatenation.
+    patterns:
+      - pattern-either:
+          - pattern: Response.Write("..." + $PARAM + "...")
+          - pattern: Response.Write("..." + $PARAM)
+    metadata:
+      category: security
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp: "A03:2021 - Injection"

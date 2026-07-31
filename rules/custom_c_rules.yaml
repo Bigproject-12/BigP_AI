@@ -1,0 +1,53 @@
+rules:
+  - id: guardrail-c-command-injection
+    languages: [c]
+    severity: ERROR
+    message: >
+      system() is called with a dynamically built command string, not a hardcoded
+      literal. This may lead to Command Injection. Validate/sanitize input or use
+      execv()-family functions with a fixed argument list instead.
+    patterns:
+      - pattern: system($CMD)
+      - pattern-not: system("...")
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+      owasp: "A03:2021 - Injection"
+
+  - id: guardrail-c-hardcoded-secret
+    languages: [c]
+    severity: ERROR
+    message: >
+      Sensitive value appears to be hardcoded as a string literal. This may lead to
+      credential leakage if the source/binary is exposed. Load this value from an
+      environment variable or a secret manager instead of hardcoding it.
+    patterns:
+      - pattern-either:
+          - pattern: char *$NAME = "...";
+          - pattern: const char *$NAME = "...";
+          - pattern: char $NAME[] = "...";
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(secret|password|api_key|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+
+  - id: guardrail-c-format-string
+    languages: [c]
+    severity: ERROR
+    message: >
+      A variable is passed directly as the format string argument instead of a
+      hardcoded literal. This may lead to a Format String vulnerability. Always
+      use a fixed format string, e.g. printf("%s", $VAR).
+    patterns:
+      - pattern-either:
+          - pattern: printf($VAR)
+          - pattern: fprintf($FP, $VAR)
+      - pattern-not: printf("...")
+      - pattern-not: fprintf($FP, "...")
+    metadata:
+      category: security
+      cwe: "CWE-134: Use of Externally-Controlled Format String"
+      owasp: "A03:2021 - Injection"
