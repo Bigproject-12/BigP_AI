@@ -1,56 +1,15 @@
 rules:
-  - id: guardrail-python-sqli-string-concat
+  - id: guardrail-python-sqli-dynamic-execute
     languages: [python]
     severity: ERROR
     message: >
-      SQL query string is built by concatenating a variable with '+'.
-      This may lead to SQL Injection. Use parameterized queries instead
-      (e.g. cursor.execute(query, (param,))).
+      SQL query is executed via cursor.execute() with a dynamically built string,
+      not a hardcoded literal. This may lead to SQL Injection. Use parameterized
+      queries instead (e.g. cursor.execute(query, (param,))).
     patterns:
-      - pattern-either:
-          - pattern: $QUERY = "..." + $VAR
-          - pattern: $QUERY = "..." + $VAR + "..."
-          - pattern: $CURSOR.execute("..." + $VAR)
-          - pattern: $CURSOR.execute("..." + $VAR + "...")
-    metadata:
-      category: security
-      cwe: "CWE-89: SQL Injection"
-      owasp: "A03:2021 - Injection"
-
-  - id: guardrail-python-sqli-fstring
-    languages: [python]
-    severity: ERROR
-    message: >
-      SQL query is built using an f-string with a variable inside.
-      This may lead to SQL Injection. Use parameterized queries instead.
-    patterns:
-      - pattern: $QUERY = f"...{$VAR}..."
-    metadata:
-      category: security
-      cwe: "CWE-89: SQL Injection"
-      owasp: "A03:2021 - Injection"
-
-  - id: guardrail-python-sqli-format
-    languages: [python]
-    severity: ERROR
-    message: >
-      SQL query is built using .format() with a variable.
-      This may lead to SQL Injection. Use parameterized queries instead.
-    patterns:
-      - pattern: $QUERY = "...".format(...)
-    metadata:
-      category: security
-      cwe: "CWE-89: SQL Injection"
-      owasp: "A03:2021 - Injection"
-
-  - id: guardrail-python-sqli-percent
-    languages: [python]
-    severity: ERROR
-    message: >
-      SQL query is built using % string formatting with a variable.
-      This may lead to SQL Injection. Use parameterized queries instead.
-    patterns:
-      - pattern: $QUERY = "..." % $VAR
+      - pattern: $CURSOR.execute($QUERY)
+      - pattern-not: $CURSOR.execute("...")
+      - pattern-not: $CURSOR.execute("...", ...)
     metadata:
       category: security
       cwe: "CWE-89: SQL Injection"
