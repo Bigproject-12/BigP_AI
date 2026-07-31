@@ -16,8 +16,8 @@ async def index_repo(request: IndexRepoRequest):
 
 @router.post("/search", response_model=SearchDuplicateResponse)
 async def search_duplicates(request: SearchDuplicateRequest):
-    results = search_similar_code(request.repo_id, request.code_content)
-    return SearchDuplicateResponse(duplicates=results)
+    results = search_similar_code(request.repo_id, request.code_content, request.language)
+    return SearchDuplicateResponse(duplicates=results) 
 
 @router.post("/remove", response_model=RemoveVectorsResponse)
 async def remove_vectors_endpoint(request: RemoveVectorsRequest):

@@ -20,7 +20,7 @@ class IndexRepoResponse(BaseModel):
 class SearchDuplicateRequest(BaseModel):
     repo_id: int = Field(..., description="검색 대상 레포의 repo_id")
     code_content: str = Field(..., description="유사도를 검사할 코드")
-
+    language: str = Field(default="java", description="검색할 코드의 언어 (청킹 방식 결정에 사용)")
 
 class SearchDuplicateResponse(BaseModel):
     duplicates: List[Dict[str, Any]] = Field(..., description="유사 코드 청크 목록 (faiss_vector_id, similarity_score)")

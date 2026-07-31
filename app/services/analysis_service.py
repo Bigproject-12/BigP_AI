@@ -448,7 +448,6 @@ async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResp
 
     print(f"[DEBUG] 받은 duplicate_snippets: {request.duplicate_snippets}")
 
-    # Spring이 이미 검색/보강해서 넘겨준 값을 그대로 사용 (FastAPI가 직접 검색하지 않음)
     duplicate_snippets = [d.model_dump() for d in (request.duplicate_snippets or [])]
 
     print(f"[DEBUG] 변환된 duplicate_snippets: {duplicate_snippets}")
@@ -466,5 +465,6 @@ async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResp
         max_complexity=security_result["max_complexity"],
         needs_refactoring=security_result["needs_refactoring"],
         complexity_details=security_result.get("complexity_details", []),
-        patched_code=security_result["patched_code"]
+        patched_code=security_result["patched_code"],
+        duplicate_snippets=request.duplicate_snippets or []
     )

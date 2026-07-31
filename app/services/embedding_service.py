@@ -150,6 +150,8 @@ def chunk_code_by_function(code_content: str, file_path: str, language: str) -> 
 MIN_CHUNK_LENGTH = 30
 
 def chunk_code_smart(code_content: str, file_path: str, language: str) -> list[dict]:
+    language = (language or "").lower()
+    
     if language in TREE_SITTER_QUERY_PATTERNS:
         try:
             chunks = chunk_code_by_function(code_content, file_path, language)
@@ -157,6 +159,7 @@ def chunk_code_smart(code_content: str, file_path: str, language: str) -> list[d
             print(f"{language} 함수 단위 파싱 실패, 슬라이딩 윈도우로 폴백: {e}")
             chunks = chunk_code(code_content, file_path)
     else:
+        print(f"[TRACE-CHUNK] {language}는 TREE_SITTER_QUERY_PATTERNS에 없어서 슬라이딩 윈도우 사용")
         chunks = chunk_code(code_content, file_path)
 
     return [c for c in chunks if len(c["code"].strip()) >= MIN_CHUNK_LENGTH]
@@ -203,22 +206,37 @@ def index_repo_files(repo_id: int, files: list[dict]) -> list[dict]:
     return metadata_result
 
 
-def search_similar_code(repo_id: int, code: str, top_k: int = 5, threshold: float = 0.78) -> list[dict]:
+def search_similar_code(repo_id: int, code: str, language: str = "java", top_k: int = 5, threshold: float = 0.7) -> list[dict]:
     path = _index_path(repo_id)
     if not os.path.exists(path):
+        print(f"[TRACE] 인덱스 파일 없음: {path}")
         return []
 
     index = faiss.read_index(path)
-    query_vector = get_embedding(code).reshape(1, -1)
-    scores, ids = index.search(query_vector, top_k)
 
-    results = []
-    for score, vec_id in zip(scores[0], ids[0]):
-        if vec_id == -1:
-            continue
-        if score >= threshold:
-            results.append({"faiss_vector_id": int(vec_id), "similarity_score": float(score)})
-    return results
+    query_chunks = chunk_code_smart(code, "query.tmp", language)
+    print(f"[TRACE] 쿼리 청크 개수: {len(query_chunks)}")
+    best_matches: dict[int, float] = {}
+    for i, chunk in enumerate(query_chunks):
+        print(f"[TRACE] 청크{i}: function_name={chunk.get('function_name')}, 길이={len(chunk['code'])}")   # 추가
+
+    for chunk in query_chunks:
+        query_vector = get_embedding(chunk["code"]).reshape(1, -1)
+        scores, ids = index.search(query_vector, top_k)
+        print(f"[TRACE] {chunk.get('function_name')} 검색 결과: scores={scores[0]}, ids={ids[0]}")   # 추가
+
+        for score, vec_id in zip(scores[0], ids[0]):
+            if vec_id == -1:
+                continue
+            if score >= threshold:
+                vec_id_int = int(vec_id)
+                if vec_id_int not in best_matches or score > best_matches[vec_id_int]:
+                    best_matches[vec_id_int] = float(score)
+
+    # 점수 높은 순으로 정렬, 상위 top_k개만 반환
+    sorted_matches = sorted(best_matches.items(), key=lambda x: x[1], reverse=True)[:top_k]
+    print(f"[TRACE] 최종 매칭 결과: {sorted_matches}")   
+    return [{"faiss_vector_id": vec_id, "similarity_score": score} for vec_id, score in sorted_matches]
 
 
 def remove_vectors(repo_id: int, vector_ids: list[int]) -> int:
