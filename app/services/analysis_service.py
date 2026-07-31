@@ -184,14 +184,12 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
         )
         raw_output = completion.choices[0].message.content.strip()
 
-        # 1차 시도: 전체를 JSON으로 바로 파싱
         try:
             parsed = json.loads(raw_output, strict=False)
             return parsed.get("patched_code", raw_output)
         except json.JSONDecodeError:
             pass
 
-        # 2차 시도: 앞뒤에 잡텍스트가 섞였을 경우, { } 부분만 추출
         match = re.search(r'\{.*\}', raw_output, re.DOTALL)
         if match:
             try:
@@ -200,14 +198,18 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
             except json.JSONDecodeError:
                 pass
 
-        # 3차 폴백: 혹시 코드 블록(백틱) 형식으로 왔을 경우도 대비
         ticks = "`" * 3
         pattern = ticks + r'(?:\w+)?\n(.*?)\n' + ticks
         code_match = re.search(pattern, raw_output, re.DOTALL)
         if code_match:
             return code_match.group(1).strip()
 
-        # 그래도 안 되면 원문이라도 반환 (완전 실패보다는 나음)
+        loose_match = re.search(r'"patched_code"\s*:\s*"(.*)"\s*\}?\s*$', raw_output, re.DOTALL) # 이거까지 했는데 안 되면 죽임ㅇㅇ
+        if loose_match:
+            extracted = loose_match.group(1)
+            extracted = extracted.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\')
+            return extracted.strip()
+
         return raw_output
 
     except Exception as e:
