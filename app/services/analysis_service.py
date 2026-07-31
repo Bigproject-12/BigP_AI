@@ -217,7 +217,7 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
         return "보완 코드 생성에 실패했습니다."
 
 
-def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, complexity_details: list) -> dict:
+def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, complexity_details: list, duplicate_snippets: list = None) -> dict:
     """사용자의 원본 프롬프트를, 발견된 문제점이 재발하지 않도록 재구성"""
 
     issues_text = ""
@@ -228,6 +228,16 @@ def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, c
         comp_list = "\n".join(f"- {c.get('message', '')}" for c in complexity_details[:5])
         issues_text += f"\n[발견된 복잡도/비효율 이슈]\n{comp_list}\n"
 
+    if duplicate_snippets:
+        dup_list = "\n\n".join(
+            f"- 함수명: {d.get('function_name')}\n"
+            f"  위치: {d.get('file_path')}\n"
+            f"  매개변수: {', '.join(d.get('parameters') or [])}\n"
+            f"  원문:\n{d.get('code')}"
+            for d in duplicate_snippets[:3]
+        )
+        issues_text += f"\n[재사용 가능한 기존 함수]\n{dup_list}\n"
+
     if not issues_text:
         issues_text = "\n(특별히 발견된 취약점이나 비효율 이슈는 없었습니다. 다만 일반적인 코드 품질 관점에서 프롬프트를 다듬어주세요.)\n"
 
@@ -237,6 +247,10 @@ def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, c
     같은 목적(기능)을 달성하되, 발견된 문제가 재발하지 않도록 프롬프트를 재작성해야 합니다.
 
     [절대 규칙]
+    - "재사용 가능한 기존 함수" 목록이 주어지면, 그 함수의 정확한 위치(파일 경로), 
+      함수명, 매개변수를 프롬프트에 구체적으로 명시하세요. 
+      단순히 "재사용하라"고만 하지 말고, "이 프로젝트의 {파일경로}에 있는 {함수명}({매개변수}) 
+      함수를 import해서 호출하라"는 식으로 실행 가능한 지시로 작성하세요.
     - 원본 프롬프트의 핵심 목적/기능 요구사항은 절대 바꾸지 마세요.
     - "안전하게", "적절히", "올바르게", "효율적으로" 같은 추상적이고 모호한 표현은 절대 사용하지 마세요.
     - 반드시 구체적인 기술 용어/기법명을 직접 명시하세요.
@@ -308,7 +322,8 @@ async def reconstruct_prompt_endpoint(request: PromptReconstructRequest) -> Prom
         request.original_prompt,
         request.code_content,
         request.vulnerabilities,
-        request.complexity_details
+        request.complexity_details,
+        request.duplicate_snippets
     )
     return PromptReconstructResponse(
         reconstructed_prompt=result["reconstructed_prompt"],

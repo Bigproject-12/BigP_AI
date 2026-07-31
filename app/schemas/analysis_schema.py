@@ -37,6 +37,7 @@ class PromptReconstructRequest(BaseModel):
     code_content: str = Field(..., description="그 프롬프트로 생성된 원본 코드")
     vulnerabilities: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="이 코드에서 발견된 보안 취약점 목록")
     complexity_details: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="이 코드에서 발견된 복잡도/비효율 이슈 목록")
+    duplicate_snippets: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
 
 
 class PromptReconstructResponse(BaseModel):
