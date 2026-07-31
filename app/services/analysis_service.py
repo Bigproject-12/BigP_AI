@@ -23,10 +23,13 @@ S3_KEY = "codebart/model.safetensors"
 AWS_REGION = "ap-southeast-1"
 
 LANGUAGE_CONFIG = {
-    "java": {"semgrep_configs": ["p/java", "./rules/custom_java_sqli.yaml"], "extension": ".java"},
-    "python": {"semgrep_configs": ["p/python", "./rules/custom_python_sqli.yaml"], "extension": ".py"},
+    "java": {"semgrep_configs": ["p/java", "./rules/custom_java_rules.yaml"], "extension": ".java"},
+    "python": {"semgrep_configs": ["p/python", "./rules/custom_python_rules.yaml"], "extension": ".py"},
     "javascript": {"semgrep_configs": ["p/javascript"], "extension": ".js"},
     "typescript": {"semgrep_configs": ["p/typescript"], "extension": ".ts"},
+    "c": {"semgrep_configs": ["p/c", "./rules/custom_c_rules.yaml"], "extension": ".c"},
+    "cpp": {"semgrep_configs": ["p/cpp", "./rules/custom_cpp_rules.yaml"], "extension": ".cpp"},
+    "csharp": {"semgrep_configs": ["p/csharp", "./rules/custom_csharp_rules.yaml"], "extension": ".cs"},
 }
 
 LANGUAGE_ALIASES = {
@@ -36,6 +39,11 @@ LANGUAGE_ALIASES = {
     "ts": "typescript",
     "tsx": "typescript",
     "java": "java",
+    "c": "c",
+    "cpp": "cpp",
+    "cc": "cpp",
+    "cs": "csharp",
+    "csharp": "csharp",
 }
 
 DEFAULT_LANGUAGE = "java"
@@ -178,7 +186,7 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
 
         # 1차 시도: 전체를 JSON으로 바로 파싱
         try:
-            parsed = json.loads(raw_output)
+            parsed = json.loads(raw_output, strict=False)
             return parsed.get("patched_code", raw_output)
         except json.JSONDecodeError:
             pass
@@ -187,7 +195,7 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
         match = re.search(r'\{.*\}', raw_output, re.DOTALL)
         if match:
             try:
-                parsed = json.loads(match.group(0))
+                parsed = json.loads(match.group(0), strict=False)
                 return parsed.get("patched_code", raw_output)
             except json.JSONDecodeError:
                 pass

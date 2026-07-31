@@ -1,0 +1,52 @@
+rules:
+  - id: guardrail-python-sqli-dynamic-execute
+    languages: [python]
+    severity: ERROR
+    message: >
+      SQL query is executed via cursor.execute() with a dynamically built string,
+      not a hardcoded literal. This may lead to SQL Injection. Use parameterized
+      queries instead (e.g. cursor.execute(query, (param,))).
+    patterns:
+      - pattern: $CURSOR.execute($QUERY)
+      - pattern-not: $CURSOR.execute("...")
+      - pattern-not: $CURSOR.execute("...", ...)
+    metadata:
+      category: security
+      cwe: "CWE-89: SQL Injection"
+      owasp: "A03:2021 - Injection"
+
+  - id: guardrail-python-hardcoded-secret
+    languages: [python]
+    severity: ERROR
+    message: >
+      Sensitive value appears to be hardcoded as a string literal. This may lead to
+      credential leakage if the source code is exposed. Load this value from an
+      environment variable or a secret manager instead of hardcoding it.
+    patterns:
+      - pattern: $NAME = "..."
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(secret|password|api_key|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+
+  - id: guardrail-python-command-injection
+    languages: [python]
+    severity: ERROR
+    message: >
+      subprocess is called with shell=True and a dynamically built command string.
+      This may lead to Command Injection. Use a list of arguments with shell=False instead.
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.run($CMD, shell=True, ...)
+          - pattern: subprocess.call($CMD, shell=True, ...)
+          - pattern: subprocess.Popen($CMD, shell=True, ...)
+      - pattern-not: subprocess.run("...", shell=True, ...)
+      - pattern-not: subprocess.call("...", shell=True, ...)
+      - pattern-not: subprocess.Popen("...", shell=True, ...)
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+      owasp: "A03:2021 - Injection"
