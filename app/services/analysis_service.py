@@ -23,7 +23,7 @@ S3_KEY = "codebart/model.safetensors"
 AWS_REGION = "ap-southeast-1"
 
 LANGUAGE_CONFIG = {
-    "java": {"semgrep_configs": ["p/java"], "extension": ".java"},
+    "java": {"semgrep_configs": ["p/java", "./rules/custom_java_sqli.yaml"], "extension": ".java"},
     "python": {"semgrep_configs": ["p/python", "./rules/custom_python_sqli.yaml"], "extension": ".py"},
     "javascript": {"semgrep_configs": ["p/javascript"], "extension": ".js"},
     "typescript": {"semgrep_configs": ["p/typescript"], "extension": ".ts"},
@@ -131,7 +131,6 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
       {snippets_text}
     """
 
-    ticks = "`" * 3
     lang_tag = (language or DEFAULT_LANGUAGE).lower()
 
     system_prompt = f"""
@@ -139,8 +138,10 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
     사용자가 코드를 주면, 보안 취약점을 해결하고 리팩토링한 완성본 코드를 제공해야 합니다.
     [절대 규칙]
     - 로직의 원래 의미(비즈니스 로직)는 절대 변경하지 말고 구조만 개선하세요.
-    - 코드는 반드시 마크다운 코드 블록({ticks}{lang_tag} 와 {ticks}) 안에 작성하세요.
-    - 코드 블록 밖에는 어떠한 설명도 적지 마세요.
+    - 절대 마크다운 헤더(#, ##), 설명 문단, 목록(1. 2. 3.) 등을 포함하지 마세요.
+    - 절대 마크다운 코드 블록(백틱 3개)을 사용하지 마세요.
+    - 반드시 아래와 같은 순수 JSON 형식으로만 응답하세요. JSON 앞뒤에 어떤 텍스트도 붙이지 마세요:
+    {{"patched_code": "여기에 완성된 {lang_tag} 코드 전체를 하나의 문자열로 작성 (줄바꿈은 \\n으로 표현)"}}
     """
 
     user_prompt = f"""
@@ -152,17 +153,16 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
     
     [원본 코드]
     {original_code}
+
+    반드시 JSON 형식으로만 응답하세요.
     """
 
     try:
         print("LLaMA 보완코드 생성 시작")
         estimated_code_tokens = max(1, len(original_code) // 3)
         expected_output_tokens = int(estimated_code_tokens * 1.3) + 512
+        sample_max_tokens = max(2048, min(expected_output_tokens, 8192))
 
-        sample_max_tokens =  max(2048, min(expected_output_tokens, 8192))
-        print(len(original_code))
-        print("나눈 값: ",len(original_code) // 1024)
-        print("현제 max 토큰:",sample_max_tokens)
         completion = client.chat.completions.create(
           model="meta/llama-3.1-8b-instruct",
           messages=[
@@ -171,19 +171,36 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
           ], 
           temperature=0.1,
           top_p=0.1,
-          max_tokens = sample_max_tokens,
+          max_tokens=sample_max_tokens,
           stream=False
         )
         raw_output = completion.choices[0].message.content.strip()
-        pattern = ticks + r'(?:\w+)?\n(.*?)\n' + ticks
-        match = re.search(pattern, raw_output, re.DOTALL)
 
+        # 1차 시도: 전체를 JSON으로 바로 파싱
+        try:
+            parsed = json.loads(raw_output)
+            return parsed.get("patched_code", raw_output)
+        except json.JSONDecodeError:
+            pass
+
+        # 2차 시도: 앞뒤에 잡텍스트가 섞였을 경우, { } 부분만 추출
+        match = re.search(r'\{.*\}', raw_output, re.DOTALL)
         if match:
-            final_code = match.group(1).strip()
-        else:
-            final_code = raw_output.replace(ticks + lang_tag, "").replace(ticks, "").strip()
+            try:
+                parsed = json.loads(match.group(0))
+                return parsed.get("patched_code", raw_output)
+            except json.JSONDecodeError:
+                pass
 
-        return final_code
+        # 3차 폴백: 혹시 코드 블록(백틱) 형식으로 왔을 경우도 대비
+        ticks = "`" * 3
+        pattern = ticks + r'(?:\w+)?\n(.*?)\n' + ticks
+        code_match = re.search(pattern, raw_output, re.DOTALL)
+        if code_match:
+            return code_match.group(1).strip()
+
+        # 그래도 안 되면 원문이라도 반환 (완전 실패보다는 나음)
+        return raw_output
 
     except Exception as e:
         print(f"LLaMA API 호출 중 에러 발생: {e}")

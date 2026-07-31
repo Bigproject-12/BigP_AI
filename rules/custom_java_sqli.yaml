@@ -1,0 +1,21 @@
+rules:
+  - id: guardrail-java-sqli-string-concat
+    languages: [java]
+    severity: ERROR
+    message: >
+      SQL query is executed via Statement.executeQuery()/executeUpdate()/execute() with a
+      dynamically built string, not a hardcoded literal. This may lead to SQL Injection.
+      Use PreparedStatement with parameterized queries and setString()/setInt() instead
+      of building SQL strings by concatenation.
+    patterns:
+      - pattern-either:
+          - pattern: $STMT.executeQuery($SQL)
+          - pattern: $STMT.executeUpdate($SQL)
+          - pattern: $STMT.execute($SQL)
+      - pattern-not: $STMT.executeQuery("...")
+      - pattern-not: $STMT.executeUpdate("...")
+      - pattern-not: $STMT.execute("...")
+    metadata:
+      category: security
+      cwe: "CWE-89: SQL Injection"
+      owasp: "A03:2021 - Injection"
