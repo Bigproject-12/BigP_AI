@@ -13,7 +13,7 @@ import re
 
 client = OpenAI(
   base_url = "https://integrate.api.nvidia.com/v1",
-  api_key = "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" 
+  api_key = "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",
 )
 MODEL_PATH = "./app/models/codebart"
 MODEL_FILE = os.path.join(MODEL_PATH, "model.safetensors") 
@@ -84,7 +84,7 @@ def translate_vulnerabilities_to_korean(vulnerabilities: list) -> list:
 
     try:
         completion = client.chat.completions.create(
-            model="meta/llama-3.1-8b-instruct",
+            model="google/diffusiongemma-26b-a4b-it",
             messages=[
                 {"role": "system", "content": (
                     "당신은 보안 취약점 설명 번역가입니다. "
@@ -166,13 +166,13 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
     """
 
     try:
-        print("LLaMA 보완코드 생성 시작")
+        print("DiffusionGemma 보완코드 생성 시작")
         estimated_code_tokens = max(1, len(original_code) // 3)
         expected_output_tokens = int(estimated_code_tokens * 1.3) + 512
         sample_max_tokens = max(2048, min(expected_output_tokens, 8192))
 
         completion = client.chat.completions.create(
-          model="meta/llama-3.1-8b-instruct",
+          model="google/diffusiongemma-26b-a4b-it",
           messages=[
               {"role": "system", "content": system_prompt},
               {"role": "user", "content": user_prompt}
@@ -213,13 +213,219 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
         return raw_output
 
     except Exception as e:
-        print(f"LLaMA API 호출 중 에러 발생: {e}")
+        print(f"DiffusionGemma API 호출 중 에러 발생: {e}")
         return "보완 코드 생성에 실패했습니다."
 
+def summarize_function(function_info: dict) -> str:
+    """재사용 후보 함수 하나를, 다른 AI가 참고할 수 있는 자연어 설명으로 요약"""
+    
+    function_name = function_info.get("function_name", "")
+    print(f"[LOG] summarize_function 시작: {function_name}")
+    file_path = function_info.get("file_path", "")
+    parameters = function_info.get("parameters") or []
+    code = function_info.get("code", "")
 
-def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, complexity_details: list, duplicate_snippets: list = None) -> dict:
-    """사용자의 원본 프롬프트를, 발견된 문제점이 재발하지 않도록 재구성"""
+    system_prompt = """
+    당신은 코드 문서화 전문가입니다.
+    주어진 함수의 원문 코드를 분석해서, 이 함수를 한 번도 본 적 없는 다른 개발자가 
+    코드를 직접 보지 않고도 정확히 이해하고 사용할 수 있도록 자연어로 설명해야 합니다.
+    
+    [절대 규칙]
+    - 반드시 다음 내용을 포함하세요: 
+      1) 어떤 매개변수를 받는지(타입과 의미)
+      2) 무엇을 반환하는지(타입과 그 안에 어떤 정보가 담기는지)
+      3) 내부적으로 정확히 어떤 처리를 하는지
+    - 코드를 그대로 복사하지 말고, 완전히 자연어 문장으로 설명하세요.
+    - "안전하게", "적절히" 같은 모호한 표현 없이, 구체적으로 설명하세요.
+    - 반드시 2~4문장의 순수 텍스트로만 응답하세요. 다른 설명, 마크다운, JSON을 포함하지 마세요.
+    """
 
+    user_prompt = f"""
+    [함수명] {function_name}
+    [매개변수] {', '.join(parameters)}
+    [원문 코드]
+    {code}
+
+    위 함수를 자연어로 요약해주세요.
+    """
+
+    try:
+        completion = client.chat.completions.create(
+            model="google/diffusiongemma-26b-a4b-it",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            top_p=0.1,
+            max_tokens=512,
+            stream=False
+        )
+        print(f"[LOG] summarize_function 완료: {function_name}")
+        summary = completion.choices[0].message.content.strip()
+        return summary
+    except Exception as e:
+        print(f"함수 요약 중 에러 발생: {e}")
+        # 실패 시 최소한의 정보라도 반환
+        return f"{function_name}({', '.join(parameters)}) 함수 (요약 생성 실패, 매개변수만 참고)"
+
+
+def draft_reconstruct_prompt(original_prompt: str, code: str, issues_text: str, feedback: str = None) -> dict:
+    """프롬프트 초안 작성. feedback이 있으면 이전 시도의 문제점을 참고해서 다시 작성"""
+    print("[LOG] draft_reconstruct_prompt 시작")
+
+    feedback_instruction = ""
+    if feedback:
+        feedback_instruction = f"""
+        [이전 시도에서 발견된 문제점 - 반드시 이번엔 고쳐서 작성하세요]
+        {feedback}
+        """
+
+    system_prompt = """
+    당신은 프롬프트 엔지니어링 전문가입니다.
+    원본 프롬프트와 발견된 문제점을 받아, 문제가 재발하지 않도록 프롬프트를 재작성하세요.
+    이 재구성된 프롬프트는 이 프로젝트 코드에 전혀 접근할 수 없는 다른 AI 도구에게 그대로 전달됩니다.
+
+    [규칙]
+    - "재사용 가능한 기존 함수" 항목엔 이미 완성된 "기능 설명"이 주어집니다. 
+        그 설명을 자연스러운 완결된 문장으로 프롬프트 본문에 포함시키세요. 
+        아래는 형식이 아니라 개념 설명입니다 - 이 문장을 그대로 베끼지 말고, 
+        실제 주어진 함수명과 파일 경로, 기능 설명을 사용해 당신만의 자연스러운 
+        문장으로 새로 작성하세요.
+        (개념 예: "회사 정보를 응답 객체로 바꾸는 기능이 이미 다른 파일에 구현되어 
+        있다면, 새로 만들지 말고 그 함수를 가져다 써라"는 취지로 작성)
+    - 복잡도 문제와 재사용 문제는 서로 다른 지시입니다. 복잡도 높은 함수는 
+      "재사용하지 말라"가 아니라 "구조를 개선하라"고 지시하세요.
+    - 복잡도가 높은 함수를 개선하라고 지시할 때, "구조를 개선하라"처럼 모호하게 
+      끝내지 마세요. 반드시 다음 중 최소 하나를 구체적으로 명시하세요: 
+      "각 등급/케이스별로 별도의 private 메서드로 분리하라", 
+      "switch-case 문으로 변경하라", "조건을 테이블(Map) 기반으로 재구성하라" 등.
+    - 같은 함수에 대한 재사용 지시를 두 번 이상 반복하지 마세요. 
+      이미 앞에서 언급한 함수는 다시 설명하지 마세요.
+    - "재사용 가능한 기존 함수" 목록에 없는 함수는 재사용 대상으로 언급하지 마세요.
+    - 원본 프롬프트의 핵심 목적은 절대 바꾸지 마세요.
+    - "안전하게", "적절히" 같은 모호한 표현은 금지합니다.
+    - 입력된 문제점 목록 각각에 대해 빠짐없이 지시 문장을 추가하세요.
+    - 이전 시도에 대한 피드백이 주어지면, 그 지적사항을 반드시 반영해서 다시 작성하세요.
+    - 반드시 순수 JSON: {"reconstructed_prompt": "...", "explanation": "..."}
+    """
+
+    user_prompt = f"""
+    [원본 프롬프트]
+    {original_prompt}
+
+    [원본 코드]
+    {code}
+
+    [발견된 문제점]
+    {issues_text}
+    {feedback_instruction}
+
+    위 문제가 재발하지 않도록 원본 프롬프트를 재구성해주세요. 반드시 JSON으로만 응답하세요.
+    """
+
+    try:
+        completion = client.chat.completions.create(
+            model="google/diffusiongemma-26b-a4b-it",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            top_p=0.1,
+            max_tokens=2048,
+            stream=False
+        )
+        print("[LOG] draft_reconstruct_prompt DiffusionGemma 응답 받음") 
+        raw_output = completion.choices[0].message.content.strip()
+
+        try:
+            parsed = json.loads(raw_output, strict=False)
+        except json.JSONDecodeError:
+            match = re.search(r'\{.*\}', raw_output, re.DOTALL)
+            parsed = json.loads(match.group(0), strict=False) if match else {"reconstructed_prompt": original_prompt, "explanation": ""}
+
+        return parsed
+    except Exception as e:
+        print(f"프롬프트 초안 작성 중 에러: {e}")
+        return {"reconstructed_prompt": original_prompt, "explanation": "초안 작성에 실패했습니다."}
+
+
+def review_prompt(draft: dict, issues_text: str) -> dict:
+    """초안을 검토만 함. 문제 있으면 그 내용을 반환, 없으면 통과 처리"""
+    print("[LOG] review_prompt 시작")
+    
+    system_prompt = """
+당신은 프롬프트 품질 검수자입니다. 직접 수정하지 말고, 오직 평가만 하세요.
+아래 [재구성된 프롬프트 초안]이 [발견된 문제점 목록]을 빠짐없이, 모순 없이 반영했는지 검토하세요.
+
+[검토 기준]
+1. 논리적 모순: "~할 수 없다"와 재사용 지시가 동시에 있는 등 앞뒤가 안 맞는 문장이 있는가?
+2. 누락: [발견된 문제점 목록]에 있는 항목 중, 초안에서 언급 자체가 아예 빠진 게 있는가?
+3. 재사용 지시가 있다면, 그 함수가 무엇을 반환하는지에 대한 최소한의 설명이 있는가?
+4. 복잡도 개선 대상 함수에 "재사용하지 말라"는 식의 잘못된 지시가 섞여있지 않은가?
+
+[중요 - 관대하게 판단할 것]
+- 서로 다른 함수는 서로 다른 기능 설명을 가지는 것이 정상입니다. 
+  "두 함수의 설명이 서로 다르다"는 이유만으로 실패 처리하지 마세요.
+- 완벽하지 않아도, 위 4가지 기준을 최소한으로 충족하면 통과(passed: true) 처리하세요. 
+  사소한 표현 방식의 차이나 문장 구조의 미묘함은 문제 삼지 마세요.
+- 오직 명백하고 중대한 문제(모순, 완전한 누락, 잘못된 지시)만 실패로 판단하세요.
+
+문제가 없으면 {"passed": true, "feedback": ""}로 응답하세요.
+명백하고 중대한 문제가 있으면 {"passed": false, "feedback": "구체적으로 어떤 부분이 왜 문제인지 설명"}으로 응답하세요.
+반드시 순수 JSON으로만 응답하세요.
+"""
+
+    user_prompt = f"""
+    [발견된 문제점 목록]
+    {issues_text}
+
+    [검토할 프롬프트 초안]
+    {draft.get('reconstructed_prompt', '')}
+
+    [초안의 재구성 이유]
+    {draft.get('explanation', '')}
+
+    위 기준으로 검토 결과를 JSON으로 응답하세요.
+    """
+
+    try:
+        completion = client.chat.completions.create(
+            model="google/diffusiongemma-26b-a4b-it",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            top_p=0.1,
+            max_tokens=1024,
+            stream=False
+        )
+        print("[LOG] review_prompt DiffusionGemma 응답 받음")
+        raw_output = completion.choices[0].message.content.strip()
+
+        try:
+            parsed = json.loads(raw_output, strict=False)
+        except json.JSONDecodeError:
+            match = re.search(r'\{.*\}', raw_output, re.DOTALL)
+            parsed = json.loads(match.group(0), strict=False) if match else {"passed": True, "feedback": ""}
+
+        return parsed
+    except Exception as e:
+        print(f"검수 중 에러 발생: {e}")
+        return {"passed": True, "feedback": ""} 
+
+def has_duplicate_paragraphs(text: str) -> bool:
+    """단순하게, 같은 문단(줄바꿈 두 번으로 구분)이 반복되는지 기계적으로 체크"""
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    return len(paragraphs) != len(set(paragraphs))
+
+def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, 
+                       complexity_details: list, duplicate_snippets: list = None,
+                       max_retries: int = 2) -> dict:
+    
+    print("[LOG] reconstruct_prompt 시작")
     issues_text = ""
     if vulnerabilities:
         vuln_list = "\n".join(f"- {v.get('message', '')}" for v in vulnerabilities[:5])
@@ -230,96 +436,39 @@ def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, c
 
     if duplicate_snippets:
         dup_list = "\n\n".join(
-            f"- 함수명: {d.get('function_name')}\n"
-            f"  위치: {d.get('file_path')}\n"
-            f"  매개변수: {', '.join(d.get('parameters') or [])}\n"
-            f"  원문:\n{d.get('code')}"
+            f"- 함수명: {d.get('function_name')}\n  위치: {d.get('file_path')}\n"
+            f"  기능 설명: {summarize_function(d)}"
             for d in duplicate_snippets[:3]
         )
         issues_text += f"\n[재사용 가능한 기존 함수]\n{dup_list}\n"
 
     if not issues_text:
-        issues_text = "\n(특별히 발견된 취약점이나 비효율 이슈는 없었습니다. 다만 일반적인 코드 품질 관점에서 프롬프트를 다듬어주세요.)\n"
+        issues_text = "\n(특별히 발견된 문제는 없었습니다.)\n"
+    # 여기까지 추가된 부분
 
-    system_prompt = """
-당신은 프롬프트 엔지니어링 전문가입니다.
-사용자가 AI에게 코드 생성을 요청했던 "원본 프롬프트"와, 그 결과로 생성된 코드에서 발견된 문제점을 받게 됩니다.
-같은 목적(기능)을 달성하되, 발견된 문제가 재발하지 않도록 프롬프트를 재작성해야 합니다.
+    best_draft = None
+    feedback = None
 
-[절대 규칙]
-- "재사용 가능한 기존 함수" 목록이 주어지면, 그 함수의 정확한 위치(파일 경로), 
-  함수명, 매개변수를 프롬프트에 구체적으로 명시하세요. 
-  단순히 "재사용하라"고만 하지 말고, "이 프로젝트의 {파일경로}에 있는 {함수명}({매개변수}) 
-  함수를 import해서 호출하라"는 식으로 실행 가능한 지시로 작성하세요.
-- **"재사용 가능한 기존 함수" 목록에 없는 함수는, [그 프롬프트로 생성된 코드] 안에 
-  이름이 보이더라도 절대 재사용 대상으로 언급하지 마세요. 특히 [그 프롬프트로 생성된 코드] 
-  자체에 정의되어 있는 함수(분석 대상 코드 자신의 함수)는 재사용 지시 대상이 될 수 없습니다.**
-- 원본 프롬프트의 핵심 목적/기능 요구사항은 절대 바꾸지 마세요.
-- "안전하게", "적절히", "올바르게", "효율적으로" 같은 추상적이고 모호한 표현은 절대 사용하지 마세요.
-- 반드시 구체적인 기술 용어/기법명을 직접 명시하세요.
-- 입력으로 주어진 [발견된 문제점] 목록(취약점, 복잡도, 재사용 가능한 함수)에 있는 항목만 반영하세요. 
-  코드를 보고 스스로 판단하여 목록에 없는 새로운 문제나 새로운 재사용 대상을 
-  추가로 지적하거나 프롬프트에 반영하지 마세요.
-- 제안하는 해결 기법이 실제로 그 문제를 해결하는지 스스로 검증하세요.
-- 입력된 문제점 목록 각각에 대해, 빠짐없이 하나씩 프롬프트 본문에 구체적인 지시 문장을 추가하세요.
-- explanation(재구성 이유)에도, [발견된 문제점] 목록에 있는 항목을 절대 누락하지 말고 
-  전부 각각 언급하세요. 목록에 없는 항목은 explanation에도 언급하지 마세요.
-- 절대 다른 설명, 코드 예시, 마크다운 코드 블록을 포함하지 마세요.
-- 반드시 아래와 같은 순수 JSON 형식으로만 응답하세요. JSON 앞뒤에 어떤 텍스트도, 백틱도 붙이지 마세요:
-{"reconstructed_prompt": "재구성된 프롬프트 전체 문자열", "explanation": "발견된 문제점 각각에 대한 반영 내용을 빠짐없이 서술"}
-"""
+    for attempt in range(max_retries + 1):
+        draft = draft_reconstruct_prompt(original_prompt, code, issues_text, feedback)
+        print(f"[LOG] {attempt+1}번째 시도 시작")
+        if has_duplicate_paragraphs(draft.get("reconstructed_prompt", "")):
+            print(f"[프롬프트 재구성] {attempt + 1}번째 시도: 중복 문단 감지, 재시도")
+            feedback = "이전 시도에서 같은 문단이 여러 번 반복되었습니다. 각 지시사항은 정확히 한 번씩만 작성하세요."
+            continue
 
-    user_prompt = f"""
-    [원본 프롬프트]
-    {original_prompt}
+        review = review_prompt(draft, issues_text)
+        
+        if review.get("passed", True):
+            best_draft = draft
+            print(f"[프롬프트 재구성] {attempt + 1}번째 시도에서 검수 통과")
+            break
+        
+        best_draft = draft
+        feedback = review.get("feedback", "")
+        print(f"[프롬프트 재구성] {attempt + 1}번째 시도 검수 실패, 피드백: {feedback}")
 
-    [그 프롬프트로 생성된 코드]
-    {code}
-
-    [이 코드에서 발견된 문제점]
-    {issues_text}
-
-    위 문제가 재발하지 않도록, 구체적인 기법을 명시해서 원본 프롬프트를 재구성해주세요.
-    반드시 JSON 형식으로만 응답하세요.
-    """
-
-    try:
-        completion = client.chat.completions.create(
-            model="meta/llama-3.1-8b-instruct",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.2,
-            top_p=0.2,
-            max_tokens=2048,
-            stream=False
-        )
-        raw_output = completion.choices[0].message.content.strip()
-
-        # 1차 시도: 전체를 JSON으로 바로 파싱
-        try:
-            parsed = json.loads(raw_output)
-        except json.JSONDecodeError:
-            # 2차 시도: 앞뒤에 잡텍스트/마크다운이 섞였을 경우, { }로 감싸인 부분만 추출
-            match = re.search(r'\{.*\}', raw_output, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group(0))
-            else:
-                raise
-
-        return {
-            "reconstructed_prompt": parsed.get("reconstructed_prompt", original_prompt),
-            "explanation": parsed.get("explanation", "")
-        }
-
-    except Exception as e:
-        print(f"프롬프트 재구성 중 에러 발생: {e}")
-        return {
-            "reconstructed_prompt": original_prompt,
-            "explanation": "프롬프트 재구성에 실패하여 원본 프롬프트를 그대로 반환합니다."
-        }
-
+    return best_draft if best_draft else {"reconstructed_prompt": original_prompt, "explanation": "재구성 실패"}
 
 async def reconstruct_prompt_endpoint(request: PromptReconstructRequest) -> PromptReconstructResponse:
     result = reconstruct_prompt(
