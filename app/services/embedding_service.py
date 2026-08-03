@@ -6,10 +6,33 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 from tree_sitter_language_pack import get_parser
 from tree_sitter import Query, QueryCursor
+import boto3
 
 EMBED_MODEL_PATH = "./app/models/codesage-small"   # 경로 변경
 FAISS_INDEX_DIR = "./app/faiss_indexes"
 DIMENSION = 1024   # 768 → 1024로 변경
+
+# ===== S3 모델 자동 다운로드 설정 =====
+S3_BUCKET = "guardrail-codebert-models-v1"
+CODESAGE_S3_KEY = "codesage-small/model.safetensors"
+AWS_REGION = "ap-southeast-1"
+
+
+def download_codesage_model_if_needed():
+    """로컬에 CodeSage 모델 가중치 파일이 없으면 S3에서 다운로드"""
+    model_file = os.path.join(EMBED_MODEL_PATH, "model.safetensors")
+    if os.path.exists(model_file):
+        print("CodeSage 모델이 이미 로컬에 존재합니다. 다운로드 스킵.")
+        return
+
+    print(f"CodeSage 모델 다운로드 중... (S3: {S3_BUCKET}/{CODESAGE_S3_KEY})")
+    os.makedirs(EMBED_MODEL_PATH, exist_ok=True)
+    s3 = boto3.client("s3", region_name=AWS_REGION)
+    s3.download_file(S3_BUCKET, CODESAGE_S3_KEY, model_file)
+    print("CodeSage 모델 다운로드 완료.")
+
+
+download_codesage_model_if_needed()
 
 embed_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH, trust_remote_code=True)
 embed_model = AutoModel.from_pretrained(EMBED_MODEL_PATH, trust_remote_code=True)

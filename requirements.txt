@@ -8,7 +8,7 @@ pydantic
 faiss-cpu==1.8.0
 tree-sitter
 tree-sitter-language-pack
-numpy
+numpy<2
 openai
 lizard
 semgrep
