@@ -269,6 +269,15 @@ def summarize_function(function_info: dict) -> str:
         # 실패 시 최소한의 정보라도 반환
         return f"{function_name}({', '.join(parameters)}) 함수 (요약 생성 실패, 매개변수만 참고)"
 
+def file_path_to_package(file_path: str, language: str = "java") -> str | None:
+    if language == "java":
+        path = file_path.replace("src/main/java/", "").replace(".java", "")
+        return path.replace("/", ".")
+    elif language == "python":
+        path = file_path.replace(".py", "")
+        return path.replace("/", ".")
+    else:
+        return None 
 
 def draft_reconstruct_prompt(original_prompt: str, code: str, issues_text: str, feedback: str = None) -> dict:
     """프롬프트 초안 작성. feedback이 있으면 이전 시도의 문제점을 참고해서 다시 작성"""
@@ -282,33 +291,46 @@ def draft_reconstruct_prompt(original_prompt: str, code: str, issues_text: str, 
         """
 
     system_prompt = """
-    당신은 프롬프트 엔지니어링 전문가입니다.
-    원본 프롬프트와 발견된 문제점을 받아, 문제가 재발하지 않도록 프롬프트를 재작성하세요.
-    이 재구성된 프롬프트는 이 프로젝트 코드에 전혀 접근할 수 없는 다른 AI 도구에게 그대로 전달됩니다.
+당신은 프롬프트 엔지니어링 전문가입니다.
+사용자가 AI에게 코드 생성을 요청했던 "원본 프롬프트"와, 그 결과로 생성된 코드에서 발견된 문제점을 받게 됩니다.
+같은 목적(기능)을 달성하되, 발견된 문제가 재발하지 않도록 프롬프트를 재작성해야 합니다.
 
-    [규칙]
-    - "재사용 가능한 기존 함수" 항목엔 이미 완성된 "기능 설명"이 주어집니다. 
-        그 설명을 자연스러운 완결된 문장으로 프롬프트 본문에 포함시키세요. 
-        아래는 형식이 아니라 개념 설명입니다 - 이 문장을 그대로 베끼지 말고, 
-        실제 주어진 함수명과 파일 경로, 기능 설명을 사용해 당신만의 자연스러운 
-        문장으로 새로 작성하세요.
-        (개념 예: "회사 정보를 응답 객체로 바꾸는 기능이 이미 다른 파일에 구현되어 
-        있다면, 새로 만들지 말고 그 함수를 가져다 써라"는 취지로 작성)
-    - 복잡도 문제와 재사용 문제는 서로 다른 지시입니다. 복잡도 높은 함수는 
-      "재사용하지 말라"가 아니라 "구조를 개선하라"고 지시하세요.
-    - 복잡도가 높은 함수를 개선하라고 지시할 때, "구조를 개선하라"처럼 모호하게 
-      끝내지 마세요. 반드시 다음 중 최소 하나를 구체적으로 명시하세요: 
-      "각 등급/케이스별로 별도의 private 메서드로 분리하라", 
-      "switch-case 문으로 변경하라", "조건을 테이블(Map) 기반으로 재구성하라" 등.
-    - 같은 함수에 대한 재사용 지시를 두 번 이상 반복하지 마세요. 
-      이미 앞에서 언급한 함수는 다시 설명하지 마세요.
-    - "재사용 가능한 기존 함수" 목록에 없는 함수는 재사용 대상으로 언급하지 마세요.
-    - 원본 프롬프트의 핵심 목적은 절대 바꾸지 마세요.
-    - "안전하게", "적절히" 같은 모호한 표현은 금지합니다.
-    - 입력된 문제점 목록 각각에 대해 빠짐없이 지시 문장을 추가하세요.
-    - 이전 시도에 대한 피드백이 주어지면, 그 지적사항을 반드시 반영해서 다시 작성하세요.
-    - 반드시 순수 JSON: {"reconstructed_prompt": "...", "explanation": "..."}
-    """
+[가장 중요한 전제]
+재구성된 프롬프트는, 원본 코드나 기존 함수의 존재를 전혀 알지 못하는 다른 AI 도구
+(ChatGPT, Gemini, Claude 등)에게 사용자가 그대로 복사해서 전달할 것입니다. 
+따라서:
+- "현재 이 함수는", "기존 코드에서는", "이 함수의 복잡도가 높으므로" 처럼 
+  "이미 존재하는 코드를 보고 있다"고 전제하는 표현은 절대 쓰지 마세요.
+- "변경하라", "리팩토링하라", "수정하라" 같이 "기존 코드를 고친다"는 뜻의 동사도 
+  쓰지 마세요. 대신 "~하도록 설계하라", "~구조로 구현하라", "처음부터 ~하지 않도록 
+  작성하라"처럼, "앞으로 새로 작성할 코드"에 대한 지시로 표현하세요.
+- 단, "재사용 가능한 기존 함수" 목록에 있는 함수만은 예외입니다. 이 함수들은 
+  실제로 프로젝트에 이미 존재하므로, "이미 구현되어 있는 이 함수를 재사용하라"고 
+  명시적으로 알려주는 것이 맞습니다.
+
+[규칙]
+- "재사용 가능한 기존 함수"를 재사용하라는 지시를 작성할 때는, 
+  반드시 "해당 클래스를 import한 뒤 호출하라"는 것까지 명시하세요. 
+  [재사용 가능한 기존 함수] 항목에 "Import 경로"가 주어졌다면, 
+  그 경로를 그대로 사용해서 "이 클래스를 import하라"고 명시하세요. 
+  Import 경로가 주어지지 않았다면, 이 언어의 표준적인 재사용 문법을 
+  사용하되 파일 경로를 참고해 합리적으로 안내하세요.
+- 복잡도 문제와 재사용 문제는 서로 다른 지시입니다. 복잡도 높은 함수는 
+  "재사용하지 말라"가 아니라, 처음부터 복잡하지 않은 구조로 설계하라고 지시하세요.
+- 복잡도가 높아지기 쉬운 로직을 설계하라고 지시할 때, "구조를 개선하라"처럼 모호하게 
+  끝내지 마세요. 반드시 다음 중 최소 하나를 구체적으로 명시하세요: 
+  "각 등급/케이스별로 별도의 private 메서드로 분리하여 구현하라", 
+  "switch-case 문 기반으로 설계하라", "조건을 테이블(Map) 기반으로 설계하라" 등.
+- 같은 함수에 대한 재사용 지시를 두 번 이상 반복하지 마세요. 
+  이미 앞에서 언급한 함수는 다시 설명하지 마세요.
+- "재사용 가능한 기존 함수" 목록에 없는 함수는 재사용 대상으로 언급하지 마세요.
+- 원본 프롬프트의 핵심 목적은 절대 바꾸지 마세요.
+- "안전하게", "적절히" 같은 모호한 표현은 금지합니다.
+- 입력된 문제점 목록 각각에 대해 빠짐없이 지시 문장을 추가하세요.
+- 이전 시도에 대한 피드백이 주어지면, 그 지적사항을 반드시 반영해서 다시 작성하세요.
+- 반드시 순수 JSON으로만 응답하세요. JSON 앞뒤에 어떤 텍스트도, 백틱도 붙이지 마세요:
+{"reconstructed_prompt": "...", "explanation": "..."}
+"""
 
     user_prompt = f"""
     [원본 프롬프트]
@@ -364,6 +386,10 @@ def review_prompt(draft: dict, issues_text: str) -> dict:
 2. 누락: [발견된 문제점 목록]에 있는 항목 중, 초안에서 언급 자체가 아예 빠진 게 있는가?
 3. 재사용 지시가 있다면, 그 함수가 무엇을 반환하는지에 대한 최소한의 설명이 있는가?
 4. 복잡도 개선 대상 함수에 "재사용하지 말라"는 식의 잘못된 지시가 섞여있지 않은가?
+5. 재사용 지시가 있다면, 그 클래스를 "import해야 한다"는 것과 
+   구체적인 패키지 경로(예: com.example.dto.CompanyResponse 형태)가 
+   명시되어 있는가? 단순히 파일 시스템 경로(src/main/java/...)만 있고 
+   패키지 import 형태가 없다면 실패로 판단하세요.
 
 [중요 - 관대하게 판단할 것]
 - 서로 다른 함수는 서로 다른 기능 설명을 가지는 것이 정상입니다. 
@@ -423,9 +449,8 @@ def has_duplicate_paragraphs(text: str) -> bool:
 
 def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list, 
                        complexity_details: list, duplicate_snippets: list = None,
-                       max_retries: int = 2) -> dict:
+                       language: str = "java", max_retries: int = 2) -> dict:
     
-    print("[LOG] reconstruct_prompt 시작")
     issues_text = ""
     if vulnerabilities:
         vuln_list = "\n".join(f"- {v.get('message', '')}" for v in vulnerabilities[:5])
@@ -435,40 +460,44 @@ def reconstruct_prompt(original_prompt: str, code: str, vulnerabilities: list,
         issues_text += f"\n[발견된 복잡도/비효율 이슈]\n{comp_list}\n"
 
     if duplicate_snippets:
-        dup_list = "\n\n".join(
-            f"- 함수명: {d.get('function_name')}\n  위치: {d.get('file_path')}\n"
-            f"  기능 설명: {summarize_function(d)}"
-            for d in duplicate_snippets[:3]
-        )
-        issues_text += f"\n[재사용 가능한 기존 함수]\n{dup_list}\n"
+        dup_entries = []
+        for d in duplicate_snippets[:3]:
+            import_path = file_path_to_package(d.get('file_path', ''), language)
+            import_line = f"  Import 경로: {import_path}\n" if import_path else ""
+            dup_entries.append(
+                f"- 함수명: {d.get('function_name')}\n"
+                f"  파일 경로: {d.get('file_path')}\n"
+                f"{import_line}"
+                f"  기능 설명: {summarize_function(d)}"
+            )
+        issues_text += f"\n[재사용 가능한 기존 함수]\n" + "\n\n".join(dup_entries) + "\n"
 
     if not issues_text:
         issues_text = "\n(특별히 발견된 문제는 없었습니다.)\n"
-    # 여기까지 추가된 부분
 
-    best_draft = None
     feedback = None
+    best_draft = None
 
     for attempt in range(max_retries + 1):
         draft = draft_reconstruct_prompt(original_prompt, code, issues_text, feedback)
-        print(f"[LOG] {attempt+1}번째 시도 시작")
+
         if has_duplicate_paragraphs(draft.get("reconstructed_prompt", "")):
             print(f"[프롬프트 재구성] {attempt + 1}번째 시도: 중복 문단 감지, 재시도")
             feedback = "이전 시도에서 같은 문단이 여러 번 반복되었습니다. 각 지시사항은 정확히 한 번씩만 작성하세요."
+            best_draft = draft
             continue
 
         review = review_prompt(draft, issues_text)
-        
+        best_draft = draft
+
         if review.get("passed", True):
-            best_draft = draft
             print(f"[프롬프트 재구성] {attempt + 1}번째 시도에서 검수 통과")
             break
-        
-        best_draft = draft
+
         feedback = review.get("feedback", "")
         print(f"[프롬프트 재구성] {attempt + 1}번째 시도 검수 실패, 피드백: {feedback}")
 
-    return best_draft if best_draft else {"reconstructed_prompt": original_prompt, "explanation": "재구성 실패"}
+    return best_draft
 
 async def reconstruct_prompt_endpoint(request: PromptReconstructRequest) -> PromptReconstructResponse:
     result = reconstruct_prompt(
