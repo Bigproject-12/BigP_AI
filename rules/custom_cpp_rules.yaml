@@ -21,14 +21,20 @@ rules:
     languages: [cpp]
     severity: ERROR
     message: >
-      Sensitive value appears to be hardcoded as a string literal. This may lead to
-      credential leakage if the source/binary is exposed. Load this value from an
-      environment variable or a secret manager instead of hardcoding it.
+      Sensitive value appears to be hardcoded as a string literal, either directly
+      or as a fallback default when an environment variable is missing. Even a
+      fallback value is a security risk - if the environment variable is not set,
+      the application will silently use this weak default instead of failing fast.
+      Load this value from an environment variable or secret manager, and throw
+      an exception if it is missing, instead of falling back to a literal.
     patterns:
       - pattern-either:
           - pattern: std::string $NAME = "...";
           - pattern: const std::string $NAME = "...";
           - pattern: const char *$NAME = "...";
+          - pattern: |
+              const char* $NAME = std::getenv("...");
+              if ($NAME == nullptr) { $NAME = "..."; }
       - metavariable-regex:
           metavariable: $NAME
           regex: (?i).*(secret|password|api_key|token|credential).*
@@ -36,3 +42,20 @@ rules:
       category: security
       cwe: "CWE-798: Use of Hard-coded Credentials"
       owasp: "A07:2021 - Identification and Authentication Failures"
+
+  - id: guardrail-cpp-sensitive-log
+    languages: [cpp]
+    severity: ERROR
+    message: >
+      A variable whose name suggests sensitive information (password, secret, token)
+      is being printed to console/stream. This can leak credentials into log files.
+    patterns:
+      - pattern-either:
+          - pattern: std::cout << $VAR
+          - pattern: printf("...", $VAR)
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i).*(password|secret|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
