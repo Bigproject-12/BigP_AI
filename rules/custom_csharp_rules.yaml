@@ -9,7 +9,9 @@ rules:
     patterns:
       - pattern-either:
           - pattern: new SqlCommand($QUERY, ...)
+          - pattern: new SqlCommand($QUERY)
       - pattern-not: new SqlCommand("...", ...)
+      - pattern-not: new SqlCommand("...")
     metadata:
       category: security
       cwe: "CWE-89: SQL Injection"
@@ -19,13 +21,18 @@ rules:
     languages: [csharp]
     severity: ERROR
     message: >
-      Sensitive value appears to be hardcoded as a string literal. This may lead to
-      credential leakage if the source code is exposed. Load this value from an
-      environment variable or a secret manager instead of hardcoding it.
+      Sensitive value appears to be hardcoded as a string literal, either directly
+      or as a fallback default when an environment variable is missing. Even a
+      fallback value is a security risk - if the environment variable is not set,
+      the application will silently use this weak default instead of failing fast.
+      Load this value from an environment variable or secret manager, and throw
+      an exception if it is missing, instead of falling back to a literal.
     patterns:
       - pattern-either:
           - pattern: private const string $NAME = "...";
           - pattern: static readonly string $NAME = "...";
+          - pattern: 'private const string $NAME = Environment.GetEnvironmentVariable("...") ?? "...";'
+          - pattern: 'static readonly string $NAME = Environment.GetEnvironmentVariable("...") ?? "...";'
       - metavariable-regex:
           metavariable: $NAME
           regex: (?i).*(secret|password|api_key|token|credential).*
@@ -49,3 +56,20 @@ rules:
       category: security
       cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
       owasp: "A03:2021 - Injection"
+
+  - id: guardrail-csharp-sensitive-log
+    languages: [csharp]
+    severity: ERROR
+    message: >
+      A variable whose name suggests sensitive information (password, secret, token)
+      is being printed to console. This can leak credentials into log files.
+    patterns:
+      - pattern-either:
+          - pattern: Console.WriteLine("..." + $VAR)
+          - pattern: Console.WriteLine($VAR)
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i).*(password|secret|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
