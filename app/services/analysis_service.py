@@ -32,6 +32,25 @@ LANGUAGE_CONFIG = {
     "csharp": {"semgrep_configs": ["p/csharp", "./rules/custom_csharp_rules.yaml"], "extension": ".cs"},
 }
 
+KNOWN_JAVA_IMPORTS = {
+    "Mac": "javax.crypto.Mac",
+    "SecretKeySpec": "javax.crypto.spec.SecretKeySpec",
+    "Cipher": "javax.crypto.Cipher",
+    "KeyGenerator": "javax.crypto.KeyGenerator",
+    "SecretKey": "javax.crypto.SecretKey",
+    "MessageDigest": "java.security.MessageDigest",
+    "SecureRandom": "java.security.SecureRandom",
+    "PreparedStatement": "java.sql.PreparedStatement",
+    "Connection": "java.sql.Connection",
+    "ResultSet": "java.sql.ResultSet",
+    "DriverManager": "java.sql.DriverManager",
+    "Statement": "java.sql.Statement",
+    "SQLException": "java.sql.SQLException",
+}
+
+NOT_AUTOCLOSEABLE_JAVA_TYPES = {"Process", "Thread"}
+
+
 LANGUAGE_ALIASES = {
     "py": "python",
     "js": "javascript",
@@ -98,7 +117,12 @@ def translate_vulnerabilities_to_korean(vulnerabilities: list) -> list:
             temperature=0.1,
             top_p=0.1,
             max_tokens=1024,
-            stream=False
+            stream=False,
+            extra_body={
+                "chat_template_kwargs": {
+                    "enable_thinking": False   # reasoning 모드 끄기
+                }
+            }
         )
         translated_joined = completion.choices[0].message.content.strip()
         translated_list = [t.strip() for t in translated_joined.split("---")]
@@ -113,14 +137,96 @@ def translate_vulnerabilities_to_korean(vulnerabilities: list) -> list:
 
     return vulnerabilities
 
+def check_known_import_errors(code: str) -> list:
+    """자주 실수하는 import 경로가 틀렸는지 화이트리스트 기반으로 확인 (Java 전용)"""
+    errors = []
+    import_lines = re.findall(r'^import\s+([\w.]+);', code, re.MULTILINE)
 
-def generate_patched_code(original_code: str, vulnerabilities: list, needs_refactoring: bool = False, 
-                           max_complexity: int = 0, language: str = DEFAULT_LANGUAGE,
-                           duplicate_snippets: list = None) -> str:
-    
+    for imported_path in import_lines:
+        class_name = imported_path.split('.')[-1]
+        if class_name in KNOWN_JAVA_IMPORTS:
+            correct_path = KNOWN_JAVA_IMPORTS[class_name]
+            if imported_path != correct_path:
+                errors.append(
+                    f"'{class_name}'의 올바른 import 경로는 '{correct_path}'인데 "
+                    f"'{imported_path}'로 되어 있습니다."
+                )
+
+    return errors
+
+def has_balanced_braces(code: str) -> bool:
+    if code.count('{') != code.count('}') or code.count('(') != code.count(')'):
+        return False
+    if '```' in code or code.strip().startswith('{"'):
+        return False
+    return True
+
+def check_try_with_resources_errors(code: str) -> list:
+    """try-with-resources에 AutoCloseable이 아닌 타입이 들어갔는지 확인"""
+    errors = []
+    try_blocks = re.findall(r'try\s*\((.*?)\)\s*\{', code, re.DOTALL)
+    for block in try_blocks:
+        for bad_type in NOT_AUTOCLOSEABLE_JAVA_TYPES:
+            if re.search(rf'\b{bad_type}\s+\w+\s*=', block):
+                errors.append(f"{bad_type}는 AutoCloseable을 구현하지 않아 try-with-resources에 사용할 수 없습니다.")
+    return errors
+
+def _build_resolved_summary(needs_refactoring: bool) -> str:
+    """지금까지 어떤 기계 검증을 통과했는지에 맞춰 동적으로 요약 문구 생성"""
+    parts = ["보안 취약점은 성공적으로 패치되었습니다."]
+    if needs_refactoring:
+        parts.append("순환 복잡도 문제도 해결되었습니다.")
+    return " ".join(parts)
+
+
+def _extract_patched_code(raw_output: str) -> str:
+    """raw_output에서 patched_code를 최대한 추출 (강력한 폴백 적용)"""
+
+    # 0. 앞뒤에 마크다운 코드펜스가 있으면 먼저 벗겨내기 (닫는 펜스 없어도 처리)
+    cleaned = raw_output.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r'^```\w*\n?', '', cleaned)   # 여는 ```json 제거
+        cleaned = re.sub(r'\n?```\s*$', '', cleaned)     # 닫는 ``` 있으면 제거 (없어도 무시)
+
+    # 1. 정상 JSON 파싱 시도
+    try:
+        parsed = json.loads(cleaned, strict=False)
+        return parsed.get("patched_code", cleaned)
+    except json.JSONDecodeError as e:
+        print(f"[DEBUG] 1차 파싱 실패: {e}")
+
+    # 2. 중괄호 부분만 추출해서 파싱 시도
+    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0), strict=False)
+            return parsed.get("patched_code", cleaned)
+        except json.JSONDecodeError as e:
+            print(f"[DEBUG] 2차 파싱 실패: {e}")
+
+    # 3. patched_code 필드만 느슨하게 추출 (닫는 따옴표를 못 찾으면 마지막 " 기준으로)
+    loose_match = re.search(r'"patched_code"\s*:\s*"(.*)', cleaned, re.DOTALL)
+    if loose_match:
+        extracted = loose_match.group(1)
+        last_quote_index = extracted.rfind('"')
+        if last_quote_index != -1:
+            extracted = extracted[:last_quote_index]
+        extracted = extracted.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\')
+        return extracted.strip()
+
+    return cleaned
+
+def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactoring: bool,
+                        max_complexity: int, language: str, duplicate_snippets: list,
+                        feedback: str = None, resolved_feedback: str = None) -> str:
+    """패치 코드 초안 생성. feedback이 있으면 이전 실패 원인을 반영해서 재작성"""
+
     refactoring_instruction = ""
     if needs_refactoring:
-        refactoring_instruction = f"\n- [알고리즘 최적화]: 이 코드는 순환 복잡도가 {max_complexity}로 매우 높습니다. 불필요한 중첩 루프와 조건문을 제거하여 시간 복잡도를 줄이고 클린 코드로 리팩토링하세요."
+        refactoring_instruction = (
+            f"\n- [알고리즘 최적화]: 이 코드는 순환 복잡도가 {max_complexity}로 매우 높습니다. "
+            f"불필요한 중첩 루프와 조건문을 제거하여 시간 복잡도를 줄이고 클린 코드로 리팩토링하세요."
+        )
 
     duplicate_instruction = ""
     if duplicate_snippets:
@@ -139,87 +245,341 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
       {snippets_text}
     """
 
+    feedback_instruction = ""
+    if feedback:
+        resolved_text = f"\n[이전 시도에서 성공적으로 해결한 부분 - 절대 원래대로 되돌리지 마세요!]\n{resolved_feedback}" if resolved_feedback else ""
+        feedback_instruction = f"""
+    [이전 시도에서 발견된 문제점 - 반드시 이번엔 고쳐서 작성하세요]
+    {feedback}
+    {resolved_text}
+    [매우 중요] 위에 지적된 문제만 정확히 고치세요. 그 외의 나머지 부분
+    (이미 올바르게 작성된 import 문, SQL 쿼리, 괄호 구조, 변수명 등)은
+    이전 시도와 최대한 동일하게 유지하세요. 지적받지 않은 부분을
+    임의로 다시 바꾸거나 새로 작성하지 마세요.
+    """
+
     lang_tag = (language or DEFAULT_LANGUAGE).lower()
 
     system_prompt = f"""
-    당신은 세계 최고의 보안 코딩 및 알고리즘 최적화 전문가입니다.
-    사용자가 코드를 주면, 보안 취약점을 해결하고 리팩토링한 완성본 코드를 제공해야 합니다.
-    [절대 규칙]
-    - 로직의 원래 의미(비즈니스 로직)는 절대 변경하지 말고 구조만 개선하세요.
-    - 절대 마크다운 헤더(#, ##), 설명 문단, 목록(1. 2. 3.) 등을 포함하지 마세요.
-    - 절대 마크다운 코드 블록(백틱 3개)을 사용하지 마세요.
-    - 반드시 아래와 같은 순수 JSON 형식으로만 응답하세요. JSON 앞뒤에 어떤 텍스트도 붙이지 마세요:
-    {{"patched_code": "여기에 완성된 {lang_tag} 코드 전체를 하나의 문자열로 작성 (줄바꿈은 \\n으로 표현)"}}
-    """
+당신은 세계 최고의 보안 코딩 및 알고리즘 최적화 전문가입니다.
+사용자가 코드를 주면, 보안 취약점을 해결하고 리팩토링한 완성본 코드를 제공해야 합니다.
+[절대 규칙]
+- 로직의 원래 의미(비즈니스 로직)는 절대 변경하지 말고 구조만 개선하세요.
+- 단, 보안 취약점 해결이 비즈니스 로직 유지보다 무조건 최우선입니다.
+  (예: 패스워드나 민감 정보가 콘솔에 출력되는 로직이 있다면 원본 유지를 무시하고 해당 출력문을 완전히 삭제하세요. 
+  MD5 등 취약한 해시는 SHA-256 이상으로 반드시 교체하세요.)
+- 어떠한 경우에도 더미 데이터(예: "root", "1234")를 포함하여 비밀번호나 API 키를 코드에 하드코딩하지 마세요. 
+  반드시 환경 변수로 대체하세요.
+- 완벽하게 컴파일되는 정상적인 코드를 작성하세요. 특히 다음 실수를 절대 하지 마세요: 
+  세미콜론 누락, 오타, 클래스나 메서드를 닫는 중괄호가 실수로 하나 더 추가되는 것.
+- 절대 마크다운 헤더(#, ##), 설명 문단, 목록(1. 2. 3.) 등을 포함하지 마세요.
+- 절대 마크다운 코드 블록(백틱 3개)을 사용하지 마세요.
+- 문자열 리터럴은 여는 따옴표와 닫는 따옴표를 정확히 짝지으세요.
+- 중괄호와 괄호의 개수가 정확히 짝이 맞는지 스스로 확인하세요.
+- SQL 쿼리 파라미터 일치: 쿼리문의 물음표(?) 개수는 반드시 그 뒤에서 호출하는 
+  pstmt.setString()/setInt() 등의 총 호출 횟수와 정확히 같아야 합니다. 
+  예를 들어 pstmt.setString(1, ...)과 pstmt.setString(2, ...) 두 번을 호출한다면, 
+  쿼리문은 반드시 "INSERT INTO users(username, password) VALUES (?, ?)"처럼 
+  물음표가 정확히 2개 있어야 합니다.
+- import 문을 작성할 때는 그 언어의 표준 라이브러리에 실제로 존재하는 정확한 패키지 경로를 사용하세요.
+- [출력 포맷 엄수] JSON 객체 바깥에는 단 한 글자의 텍스트도 절대 출력하지 마세요. 
+  "Wait", "Self-correction", 참고 설명, 재확인 문구 등을 포함해 어떤 부연 설명도 
+  JSON 앞뒤에 붙이지 마세요. 오직 순수한 JSON 객체 하나만 출력하세요.
+- thought_process는 반드시 한 문장 이내로 짧게 작성하세요. 길게 서술하지 마세요.
+- 자신이 작성한 patched_code에 문법 오류가 없는지 응답을 제출하기 전에 마지막으로 다시 한번 확인하세요.
+- 반드시 아래와 같은 순수 JSON 형식으로만 응답하세요:
+{{
+    "thought_process": "핵심 수정사항을 한 문장으로만 요약",
+    "patched_code": "여기에 완성된 {lang_tag} 코드 전체를 하나의 문자열로 작성 (줄바꿈은 \\n으로 표현, 쌍따옴표는 \\\"로 이스케이프)"
+}}
+"""
 
     user_prompt = f"""
     [발견된 보안 취약점 리스트]
     {json.dumps(vulnerabilities, ensure_ascii=False, indent=2)}
-    
+
     [수정 요청 사항]
     - 발견된 보안 취약점(SQL Injection 등)을 완벽하게 패치하세요.{refactoring_instruction}{duplicate_instruction}
-    
+    {feedback_instruction}
     [원본 코드]
     {original_code}
 
     반드시 JSON 형식으로만 응답하세요.
     """
 
-    try:
-        print("DiffusionGemma 보완코드 생성 시작")
-        estimated_code_tokens = max(1, len(original_code) // 3)
-        expected_output_tokens = int(estimated_code_tokens * 1.3) + 512
-        sample_max_tokens = max(2048, min(expected_output_tokens, 8192))
+    estimated_code_tokens = max(1, len(original_code) // 3)
+    expected_output_tokens = int(estimated_code_tokens * 1.3) + 512
+    sample_max_tokens = max(2048, min(expected_output_tokens, 16384))   # 상한도 늘림
 
-        completion = client.chat.completions.create(
+    completion = client.chat.completions.create(
         model="google/diffusiongemma-26b-a4b-it",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
-        ], 
+        ],
         temperature=0.1,
         top_p=0.1,
         max_tokens=sample_max_tokens,
-        stream=False
-        )
-        raw_output = completion.choices[0].message.content.strip()
-        print(f"[DEBUG] raw_output: {raw_output}")
+        stream=False,
+        extra_body={
+            "chat_template_kwargs": {
+                "enable_thinking": False
+            }
+        }
+    )
 
-        # 1차 시도
+    choice = completion.choices[0]
+    print(f"[DEBUG] finish_reason: {choice.finish_reason}")
+
+    message_content = choice.message.content
+
+    if message_content is None:
+        reasoning_content = getattr(choice.message, 'reasoning', None)
+        if reasoning_content:
+            print(f"[DEBUG] content는 None이지만 reasoning 필드에 내용이 있어 이를 사용합니다.")
+            message_content = reasoning_content
+        else:
+            print(f"[DEBUG] content와 reasoning 모두 비어있음. 전체 choice 객체: {choice}")
+            raise ValueError("모델이 빈 응답을 반환했습니다.")
+
+    raw_output = message_content.strip()   # if 블록 밖으로 뺌 (들여쓰기 수정)
+    print(f"[DEBUG] raw_output: {raw_output}")
+
+    return _extract_patched_code(raw_output)
+
+def verify_patched_code(patched_code: str, original_code: str, language: str) -> dict:
+    """생성된 패치 코드가 문법적으로 유효하고 실행 가능한지 검증만 함 (직접 수정 안 함)"""
+
+    lang_tag = (language or DEFAULT_LANGUAGE).lower()
+
+    system_prompt = f"""
+    당신은 {lang_tag} 코드 품질 검수자입니다. 직접 수정하지 말고, 오직 평가만 하세요.
+    아래 [검토할 코드]가 다음 기준을 만족하는지 확인하세요:
+
+    1. 문법 오류: 괄호/중괄호/따옴표가 정확히 짝이 맞는가? 컴파일 가능한 문법인가?
+    2. SQL 문법: SQL 쿼리가 있다면, 파라미터 자리표시자(?, 등)의 개수가
+       실제 바인딩되는 값의 개수와 정확히 일치하는가?
+    3. Import 경로: 모든 import 문이 실제로 존재하는 표준 라이브러리 경로를 정확히
+       가리키는가? (예: Java에서 암호화 관련 클래스는 javax.crypto 패키지에 있지 java.crypto가 아닙니다.)
+    4. 로직 보존: [원본 코드]의 핵심 기능(비즈니스 로직)이 그대로 유지되는가?
+    단, 보안 취약점을 해결하기 위한 다음과 같은 변화는 '로직 훼손'으로 간주하지 말고 
+    정상적인 개선으로 판단하여 통과(Pass) 시키세요:
+    - 민감한 정보(비밀번호, API 키 등)를 출력하는 로그를 삭제하거나 마스킹하는 것
+    - 취약한 해시 함수(MD5 등)를 안전한 함수(SHA-256 등)로 교체하는 것
+    - Statement를 PreparedStatement로 변경하여 SQL Injection을 방지하는 것
+    - 하드코딩된 자격 증명을 환경 변수 로드 방식으로 변경하는 것
+
+    문제가 없으면 {{"passed": true, "feedback": ""}}로 응답하세요.
+    문제가 있으면 {{"passed": false, "feedback": "정확히 어느 부분이 왜 문제인지 구체적으로 설명"}}으로 응답하세요.
+    반드시 순수 JSON으로만 응답하세요.
+    """
+
+    user_prompt = f"""
+    [원본 코드]
+    {original_code}
+
+    [검토할 코드]
+    {patched_code}
+
+    위 기준으로 검토 결과를 JSON으로 응답하세요.
+    """
+
+    try:
+        completion = client.chat.completions.create(
+            model="google/diffusiongemma-26b-a4b-it",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            top_p=0.1,
+            max_tokens=2048,
+            stream=False,
+            extra_body={
+                "chat_template_kwargs": {
+                    "enable_thinking": False
+                }
+            }
+        )
+
+        choice = completion.choices[0]
+        print(f"[DEBUG] verify_patched_code finish_reason: {choice.finish_reason}")
+
+        message_content = choice.message.content
+        if message_content is None:
+            reasoning_content = getattr(choice.message, 'reasoning', None)
+            message_content = reasoning_content if reasoning_content else '{"passed": true, "feedback": ""}'
+
+        raw_output = message_content.strip()
+
         try:
             parsed = json.loads(raw_output, strict=False)
-            return parsed.get("patched_code", raw_output)
-        except json.JSONDecodeError as e:   # ← 'as e' 추가! (버그 수정)
-            print(f"[DEBUG] 1차 파싱 실패: {e}")
+        except json.JSONDecodeError:
+            match = re.search(r'\{.*\}', raw_output, re.DOTALL)
+            parsed = json.loads(match.group(0), strict=False) if match else {"passed": False, "feedback": "평가자 응답 파싱 실패. 다시 시도하세요."}
 
-        # 2차 시도
-        match = re.search(r'\{.*\}', raw_output, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(0), strict=False)
-                return parsed.get("patched_code", raw_output)
-            except json.JSONDecodeError as e:
-                print(f"[DEBUG] 2차 파싱 실패: {e}")
+        return parsed
+    except Exception as e:
+        print(f"코드 검증(실행가능성) 중 에러 발생: {e}")
+        return {"passed": False, "feedback": "코드 검증 중 시스템 에러가 발생하여 실패 처리되었습니다."}
 
-        # 3차 시도 (백틱 코드블록)
-        ticks = "`" * 3
-        pattern = ticks + r'(?:\w+)?\n(.*?)\n' + ticks
-        code_match = re.search(pattern, raw_output, re.DOTALL)
-        if code_match:
-            return code_match.group(1).strip()
+def verify_issues_resolved(patched_code: str, original_code: str, vulnerabilities: list,
+                            needs_refactoring: bool, max_complexity: int,
+                            duplicate_snippets: list, language: str) -> dict:
 
-        # 4차 시도 (느슨한 정규식 추출)
-        loose_match = re.search(r'"patched_code"\s*:\s*"(.*)"\s*\}*\s*$', raw_output, re.DOTALL)
-        if loose_match:
-            extracted = loose_match.group(1)
-            extracted = extracted.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\')
-            return extracted.strip()
+    # 1. [기계 검증 1] Semgrep으로 실제 취약점이 남았는지 칼같이 체크
+    security_report = run_semgrep(patched_code, language)
+    if security_report["has_vulnerability"]:
+        remaining_issues = "\n".join(f"- {v.get('message', '')}" for v in security_report["vulnerabilities"])
+        return {
+            "passed": False,
+            "feedback": f"Semgrep 재검사 결과, 다음 취약점이 여전히 남아있습니다. 즉시 수정하세요:\n{remaining_issues}",
+            "resolved": ""   # 보안조차 아직 통과 못 했으니, 뭔가 "해결됐다"고 말할 게 없음
+        }
 
-        # 다 실패하면 원문이라도 반환
-        return raw_output
+    # 2. [기계 검증 2] Lizard로 복잡도가 실제로 줄었는지 체크 (리팩토링이 필요했던 경우에만)
+    if needs_refactoring:
+        complexity_report = analyze_complexity(patched_code, language)
+        COMPLEXITY_THRESHOLD = 15
+        if complexity_report["max_complexity"] > COMPLEXITY_THRESHOLD:
+            return {
+                "passed": False,
+                "feedback": f"순환 복잡도가 여전히 {complexity_report['max_complexity']}로 너무 높습니다. 중첩 루프나 조건문을 제거하여 리팩토링하세요.",
+                "resolved": "보안 취약점은 성공적으로 패치되었습니다."   # 여긴 needs_refactoring이 True인 게 확실하니 그대로 둬도 됨(복잡도 얘기는 안 넣음, 이건 아직 실패 중이니까)
+            }
+
+    # 3. [LLM 검증] 재사용 여부만 확인. duplicate_snippets 없으면 여기서 바로 통과
+    resolved_so_far = _build_resolved_summary(needs_refactoring)   # 실제 상황에 맞게 동적 생성
+
+    if not duplicate_snippets:
+        return {"passed": True, "feedback": "", "resolved": resolved_so_far}
+
+    lang_tag = (language or DEFAULT_LANGUAGE).lower()
+
+    dup_list = "\n".join(
+        f"- {d.get('function_name')}() 함수는 {d.get('file_path')}의 기존 함수와 재사용되어야 함 "
+        f"(매개변수: {', '.join(d.get('parameters') or [])})"
+        for d in duplicate_snippets[:2]
+    )
+
+    system_prompt = f"""
+    당신은 {lang_tag} 코드 재사용성 검수자입니다. 직접 수정하지 말고, 오직 평가만 하세요.
+    보안 취약점{"과 복잡도 문제는" if needs_refactoring else "은"} 이미 기계적으로 검증되어 통과했습니다.
+    당신은 오직 "기존 함수 재사용 여부"만 확인하세요.
+
+    [검토 기준]
+    - [반드시 재사용해야 할 기존 함수] 목록에 있는 각 함수가, [검토할 코드]에서
+      실제로 import/호출되어 재사용되고 있는지 확인하세요.
+    - 원본 로직을 그대로 복사해서 새로 정의한 경우(재사용 안 함)는 실패로 판단하세요.
+
+    문제가 없으면 {{"passed": true, "feedback": "", "resolved": "재사용까지 포함해 모든 문제가 해결되었습니다."}}로 응답하세요.
+    문제가 있으면 {{"passed": false, "feedback": "구체적으로 어떤 함수가 재사용되지 않았는지 설명", "resolved": "{resolved_so_far}"}}로 응답하세요.
+    반드시 순수 JSON으로만 응답하세요.
+    """
+
+    user_prompt = f"""
+    [반드시 재사용해야 할 기존 함수]
+    {dup_list}
+
+    [검토할 코드]
+    {patched_code}
+
+    위 함수들이 실제로 재사용되었는지 검토 결과를 JSON으로 응답하세요.
+    """
+
+    try:
+        completion = client.chat.completions.create(
+            model="google/diffusiongemma-26b-a4b-it",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            top_p=0.1,
+            max_tokens=1024,
+            stream=False,
+            extra_body={
+                "chat_template_kwargs": {
+                    "enable_thinking": False   # reasoning 모드 끄기
+                }
+            }
+        )
+        raw_output = completion.choices[0].message.content.strip()
+
+        try:
+            parsed = json.loads(raw_output, strict=False)
+        except json.JSONDecodeError:
+            match = re.search(r'\{.*\}', raw_output, re.DOTALL)
+            # 파싱 실패 시에도, 실제로 어떤 검증을 거쳤는지에 맞는 문구를 씀 (하드코딩 아님)
+            parsed = json.loads(match.group(0), strict=False) if match else {
+                "passed": False, "feedback": "재사용성 검증 응답 파싱 실패.", "resolved": resolved_so_far
+            }
+
+        return parsed
+    except Exception as e:
+        print(f"재사용성 검증 중 에러 발생: {e}")
+        return {"passed": False, "feedback": "재사용성 검증 중 시스템 에러가 발생했습니다.", "resolved": resolved_so_far}
+
+def generate_patched_code(original_code, vulnerabilities, needs_refactoring=False,
+                           max_complexity=0, language=DEFAULT_LANGUAGE,
+                           duplicate_snippets=None, max_retries=4):
+    try:
+        feedback = None
+        resolved_feedback = None
+        best_code = None
+
+        for attempt in range(max_retries + 1):
+            print(f"[코드 생성] {attempt + 1}번째 시도")
+
+            patched_code = draft_patched_code(
+                original_code, vulnerabilities, needs_refactoring,
+                max_complexity, language, duplicate_snippets, feedback, resolved_feedback
+            )
+
+            # 1단계: 괄호/중괄호 체크
+            if not has_balanced_braces(patched_code):
+                feedback = "생성된 코드의 괄호 또는 중괄호 개수가 맞지 않습니다."
+                print(f"[코드 생성] {attempt + 1}번째 시도: 괄호 불균형 감지 - 재시도")
+                continue
+
+            best_code = patched_code
+
+            # 2단계: import / try-with-resources 화이트리스트 체크
+            if language.lower() == "java":
+                import_errors = check_known_import_errors(patched_code)
+                twr_errors = check_try_with_resources_errors(patched_code)
+                all_errors = import_errors + twr_errors
+                if all_errors:
+                    feedback = "다음 문제가 있습니다: " + " ".join(all_errors)
+                    print(f"[코드 생성] {attempt + 1}번째 시도: import/리소스 오류 감지 - {feedback}")
+                    continue
+
+            # 3단계: 문법/실행가능성 검증 (LLM)
+            syntax_review = verify_patched_code(patched_code, original_code, language)
+            if not syntax_review.get("passed", True):
+                feedback = syntax_review.get("feedback", "")
+                print(f"[코드 생성] {attempt + 1}번째 시도 문법 검증 실패: {feedback}")
+                continue
+
+            # 4단계: 하이브리드 검증 (Semgrep + Lizard + LLM 재사용성) — verify_issues_resolved로 복원
+            issue_review = verify_issues_resolved(
+                patched_code, original_code, vulnerabilities,
+                needs_refactoring, max_complexity, duplicate_snippets, language
+            )
+            if issue_review.get("passed", True):
+                print(f"[코드 생성] {attempt + 1}번째 시도에서 모든 검증 통과")
+                return patched_code
+
+            feedback = issue_review.get("feedback", "")
+            resolved_feedback = issue_review.get("resolved", "")
+            print(f"[해결 피드백] {attempt + 1}번째 시도 해결한 문제: {resolved_feedback}")
+            print(f"[코드 생성] {attempt + 1}번째 시도 문제해결 검증 실패: {feedback}")
+
+        print("[코드 생성] 최대 재시도 횟수 도달, 마지막으로 최소 조건을 통과한 결과를 반환")
+        return best_code if best_code is not None else "보완 코드 생성에 실패했습니다."
 
     except Exception as e:
-        print(f"DiffusionGemma API 호출 중 에러 발생: {e}")
+        print(f"코드 생성 중 에러 발생: {e}")
         return "보완 코드 생성에 실패했습니다."
 
 def summarize_function(function_info: dict) -> str:
@@ -265,7 +625,12 @@ def summarize_function(function_info: dict) -> str:
             temperature=0.1,
             top_p=0.1,
             max_tokens=512,
-            stream=False
+            stream=False,
+            extra_body={
+                "chat_template_kwargs": {
+                    "enable_thinking": False   # reasoning 모드 끄기
+                }
+            }
         )
         print(f"[LOG] summarize_function 완료: {function_name}")
         summary = completion.choices[0].message.content.strip()
@@ -294,6 +659,9 @@ def draft_reconstruct_prompt(original_prompt: str, code: str, issues_text: str, 
         feedback_instruction = f"""
         [이전 시도에서 발견된 문제점 - 반드시 이번엔 고쳐서 작성하세요]
         {feedback}
+        주의: 위 문제만 고치고, 그 외의 나머지 부분(이미 정상적으로 작성된 import, 
+        SQL 쿼리, 괄호 등)은 이전 시도와 최대한 동일하게 유지하세요. 
+        문제와 무관한 부분을 임의로 다시 바꾸지 마세요.
         """
 
     system_prompt = """
@@ -364,7 +732,12 @@ def draft_reconstruct_prompt(original_prompt: str, code: str, issues_text: str, 
             temperature=0.1,
             top_p=0.1,
             max_tokens=2048,
-            stream=False
+            stream=False,
+            extra_body={
+                "chat_template_kwargs": {
+                    "enable_thinking": False   # reasoning 모드 끄기
+                }
+            }
         )
         print("[LOG] draft_reconstruct_prompt DiffusionGemma 응답 받음") 
         raw_output = completion.choices[0].message.content.strip()
@@ -434,7 +807,12 @@ def review_prompt(draft: dict, issues_text: str) -> dict:
             temperature=0.1,
             top_p=0.1,
             max_tokens=1024,
-            stream=False
+            stream=False,
+            extra_body={
+                "chat_template_kwargs": {
+                    "enable_thinking": False   # reasoning 모드 끄기
+                }
+            }
         )
         print("[LOG] review_prompt DiffusionGemma 응답 받음")
         raw_output = completion.choices[0].message.content.strip()
@@ -536,7 +914,12 @@ def run_semgrep(code_content: str, language: str = DEFAULT_LANGUAGE) -> dict:
             cmd += ['--config', config]
         cmd += ['--json', temp_file_path]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+        # Semgrep 서브프로세스가 UTF-8을 쓰도록 환경변수 명시적으로 전달
+        subprocess_env = os.environ.copy()
+        subprocess_env["PYTHONUTF8"] = "1"
+        subprocess_env["PYTHONIOENCODING"] = "utf-8"
+
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', env=subprocess_env)
         output_data = json.loads(result.stdout)
         results = output_data.get('results', [])
         
