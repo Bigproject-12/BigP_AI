@@ -13,7 +13,7 @@ import re
 
 client = OpenAI(
   base_url = os.getenv("NVIDIA_BASE_URL"),
-  api_key = os.getenv("NVIDIA_BASE_URL"),
+  api_key = os.getenv("NVIDIA_API_KEY"),
 )
 MODEL_PATH = "./app/models/codebart"
 MODEL_FILE = os.path.join(MODEL_PATH, "model.safetensors") 
