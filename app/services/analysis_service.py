@@ -12,8 +12,8 @@ import lizard
 import re
 
 client = OpenAI(
-  base_url = "https://integrate.api.nvidia.com/v1",
-  api_key = "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",
+  base_url = os.getenv("NVIDIA_BASE_URL"),
+  api_key = os.getenv("NVIDIA_BASE_URL"),
 )
 MODEL_PATH = "./app/models/codebart"
 MODEL_FILE = os.path.join(MODEL_PATH, "model.safetensors") 
@@ -172,44 +172,50 @@ def generate_patched_code(original_code: str, vulnerabilities: list, needs_refac
         sample_max_tokens = max(2048, min(expected_output_tokens, 8192))
 
         completion = client.chat.completions.create(
-          model="google/diffusiongemma-26b-a4b-it",
-          messages=[
-              {"role": "system", "content": system_prompt},
-              {"role": "user", "content": user_prompt}
-          ], 
-          temperature=0.1,
-          top_p=0.1,
-          max_tokens=sample_max_tokens,
-          stream=False
+        model="google/diffusiongemma-26b-a4b-it",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ], 
+        temperature=0.1,
+        top_p=0.1,
+        max_tokens=sample_max_tokens,
+        stream=False
         )
         raw_output = completion.choices[0].message.content.strip()
+        print(f"[DEBUG] raw_output: {raw_output}")
 
+        # 1차 시도
         try:
             parsed = json.loads(raw_output, strict=False)
             return parsed.get("patched_code", raw_output)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:   # ← 'as e' 추가! (버그 수정)
+            print(f"[DEBUG] 1차 파싱 실패: {e}")
 
+        # 2차 시도
         match = re.search(r'\{.*\}', raw_output, re.DOTALL)
         if match:
             try:
                 parsed = json.loads(match.group(0), strict=False)
                 return parsed.get("patched_code", raw_output)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                print(f"[DEBUG] 2차 파싱 실패: {e}")
 
+        # 3차 시도 (백틱 코드블록)
         ticks = "`" * 3
         pattern = ticks + r'(?:\w+)?\n(.*?)\n' + ticks
         code_match = re.search(pattern, raw_output, re.DOTALL)
         if code_match:
             return code_match.group(1).strip()
 
-        loose_match = re.search(r'"patched_code"\s*:\s*"(.*)"\s*\}?\s*$', raw_output, re.DOTALL) # 이거까지 했는데 안 되면 죽임ㅇㅇ
+        # 4차 시도 (느슨한 정규식 추출)
+        loose_match = re.search(r'"patched_code"\s*:\s*"(.*)"\s*\}*\s*$', raw_output, re.DOTALL)
         if loose_match:
             extracted = loose_match.group(1)
             extracted = extracted.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\')
             return extracted.strip()
 
+        # 다 실패하면 원문이라도 반환
         return raw_output
 
     except Exception as e:
