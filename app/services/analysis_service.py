@@ -590,7 +590,8 @@ def generate_patched_code(original_code, vulnerabilities, needs_refactoring=Fals
         error_history = []
         resolved_history = []
         best_code = None
-        is_success = False  # 성공 여부를 추적하는 플래그 추가
+        is_success = False
+        attempt = -1 
         
         for attempt in range(actual_retries):
             logger.info(f"====== [코드 생성] {attempt + 1}/{actual_retries}번째 시도 ======")
