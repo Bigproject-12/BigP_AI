@@ -2,3 +2,4 @@
 {"timestamp": 1786043204.910986, "language": "JAVA", "vulnerability_count": 9, "status": "success", "attempts": 2, "elapsed_seconds": 11.46}
 {"timestamp": 1786043545.1171932, "language": "JAVA", "vulnerability_count": 9, "status": "fail", "attempts": 3, "elapsed_seconds": 66.46}
 {"timestamp": 1786043619.9382908, "language": "JAVA", "vulnerability_count": 1, "status": "fail", "attempts": 3, "elapsed_seconds": 30.9}
+{"timestamp": 1786044110.7616866, "language": "JAVA", "vulnerability_count": 9, "status": "success", "attempts": 1, "elapsed_seconds": 9.98}
