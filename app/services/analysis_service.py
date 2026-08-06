@@ -10,6 +10,9 @@ from app.schemas.analysis_schema import AICodeDetectionRequest, AICodeDetectionR
 from openai import OpenAI
 import lizard
 import re
+import time
+import logging
+import functools
 
 client = OpenAI(
   base_url = os.getenv("NVIDIA_BASE_URL"),
@@ -66,6 +69,36 @@ LANGUAGE_ALIASES = {
 }
 
 DEFAULT_LANGUAGE = "java"
+
+class PromptBuilder:
+    """[38, 39번 해결] 프롬프트 조립을 전담하는 팩토리 클래스 (System/User 역할 명확히 분리)"""
+    
+    @staticmethod
+    def build_patch_prompts(original_code, vulnerabilities, language, error_history, resolved_history):
+        lang_tag = (language or "java").lower()
+        
+        system_prompt = f"""You are a strict secure coding expert.
+[PRIORITIES & RULES]
+1. OUTPUT FORMAT: MUST return a valid JSON object. No markdown.
+2. SECURITY PATCH: Fix vulnerabilities (No hardcoded secrets, use PreparedStatement, SHA-256).
+3. LOGIC PRESERVATION: Keep original business logic.
+4. SYNTAX: Ensure perfectly balanced brackets and valid {lang_tag} syntax."""
+
+        history_instruction = ""
+        if resolved_history:
+            history_instruction += "\n[KEEP]\n" + "\n".join(f"- {r}" for r in resolved_history)
+        if error_history:
+            history_instruction += "\n[AVOID]\n" + "\n".join(f"- {e}" for e in error_history)
+
+        vuln_text = "\n".join([f"- {v.get('rule_id')}: {v.get('message')}" for v in vulnerabilities])
+        
+        user_prompt = f"[VULNERABILITIES]\n{vuln_text}\n{history_instruction}\n[ORIGINAL CODE]\n{original_code}"
+        
+        # [40번 해결] 프롬프트 길이 사전 검증 (대략적인 토큰 수 방어)
+        if len(user_prompt) > 40000: # 문자가 너무 길면 (예: 1만 토큰 이상)
+            raise ValueError("원본 코드가 너무 길어 모델의 컨텍스트 한도를 초과합니다. 코드를 분할하세요.")
+            
+        return system_prompt, user_prompt
 
 
 def get_language_config(language: str) -> dict:
@@ -180,247 +213,274 @@ def _build_resolved_summary(needs_refactoring: bool) -> str:
 
 
 def _extract_patched_code(raw_output: str) -> str:
-    """raw_output에서 patched_code를 최대한 추출 (강력한 폴백 적용)"""
-
-    # 0. 앞뒤에 마크다운 코드펜스가 있으면 먼저 벗겨내기 (닫는 펜스 없어도 처리)
-    cleaned = raw_output.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r'^```\w*\n?', '', cleaned)   # 여는 ```json 제거
-        cleaned = re.sub(r'\n?```\s*$', '', cleaned)     # 닫는 ``` 있으면 제거 (없어도 무시)
-
-    # 1. 정상 JSON 파싱 시도
+    """강력한 전처리 및 스택 기반 중괄호 추출을 적용한 패치 코드 추출"""
+    
+    # 1. 마크다운 찌꺼기 완벽 제거 (11번 문제 해결)
+    # ```json ... ``` 형태를 확실하게 벗겨냄
+    cleaned = re.sub(r'```(?:json|java|python|cpp|c)?(.*?)```', r'\1', raw_output, flags=re.DOTALL)
+    cleaned = cleaned.strip()
+    # 닫는 펜스 없이 끝난 경우 대비
+    cleaned = re.sub(r'^```\w*\n?', '', cleaned)
+    cleaned = re.sub(r'\n?```\s*$', '', cleaned)
+    
+    # 2. Self-Correction ("Wait...", "Actually...") 제거 (12번 문제 해결)
+    # 무조건 첫 번째 '{' 이전의 모든 헛소리를 날려버림
+    start_idx = cleaned.find('{')
+    if start_idx == -1:
+        print("[DEBUG] JSON 시작 기호 '{' 를 찾을 수 없습니다.")
+        return ""  # 실패 시 빈 문자열 반환 -> 호출부에서 에러 누적 후 재시도
+    
+    cleaned = cleaned[start_idx:]
+    
+    # 3. 정상 JSON 파싱 시도
     try:
         parsed = json.loads(cleaned, strict=False)
-        return parsed.get("patched_code", cleaned)
-    except json.JSONDecodeError as e:
-        print(f"[DEBUG] 1차 파싱 실패: {e}")
+        return parsed.get("patched_code", "")
+    except json.JSONDecodeError:
+        pass
 
-    # 2. 중괄호 부분만 추출해서 파싱 시도
-    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
-    if match:
+    # 4. 스택(Stack) 기반 중괄호 균형 추출 알고리즘 (13, 14번 문제 해결)
+    # 정규식 {.*} 의 치명적 단점을 극복하고 완벽한 JSON 덩어리만 핀셋으로 빼냄
+    stack = []
+    end_idx = -1
+    for i, char in enumerate(cleaned):
+        if char == '{':
+            stack.append(i)
+        elif char == '}':
+            if stack:
+                stack.pop()
+                if not stack: # 스택이 비었다면 짝이 완벽하게 맞는 객체가 닫힌 것
+                    end_idx = i
+                    break
+    
+    if end_idx != -1:
+        json_str = cleaned[:end_idx + 1]
         try:
-            parsed = json.loads(match.group(0), strict=False)
-            return parsed.get("patched_code", cleaned)
-        except json.JSONDecodeError as e:
-            print(f"[DEBUG] 2차 파싱 실패: {e}")
+            parsed = json.loads(json_str, strict=False)
+            return parsed.get("patched_code", "")
+        except json.JSONDecodeError:
+            pass
 
-    # 3. patched_code 필드만 느슨하게 추출 (닫는 따옴표를 못 찾으면 마지막 " 기준으로)
-    loose_match = re.search(r'"patched_code"\s*:\s*"(.*)', cleaned, re.DOTALL)
+    # 5. 최후의 보루 (안전한 정규식 추출) (15번 문제 해결)
+    # 어설픈 추출은 Syntax Error 사이클을 유발하므로 정규식을 아주 엄격하게 변경
+    loose_match = re.search(r'"patched_code"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', cleaned, re.DOTALL)
     if loose_match:
         extracted = loose_match.group(1)
-        last_quote_index = extracted.rfind('"')
-        if last_quote_index != -1:
-            extracted = extracted[:last_quote_index]
         extracted = extracted.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\')
         return extracted.strip()
+        
+    print("[DEBUG] 모든 JSON 추출 시도 실패")
+    return ""  # 억지로 원본을 넘기지 않고 빈 문자열 반환하여 완벽한 재시도 유도
 
-    return cleaned
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactoring: bool,
-                        max_complexity: int, language: str, duplicate_snippets: list,
-                        feedback: str = None, resolved_feedback: str = None) -> str:
-    """패치 코드 초안 생성. feedback이 있으면 이전 실패 원인을 반영해서 재작성"""
+                       max_complexity: int, language: str, duplicate_snippets: list,
+                       error_history: list = None, resolved_history: list = None) -> str:
+    """패치 코드 초안 생성. error_history 배열을 통해 이전 실패 원인을 누적 반영"""
 
+    lang_tag = (language or "java").lower()
+
+    # 1. 추가 지시사항 조립 (간결화)
     refactoring_instruction = ""
     if needs_refactoring:
-        refactoring_instruction = (
-            f"\n- [알고리즘 최적화]: 이 코드는 순환 복잡도가 {max_complexity}로 매우 높습니다. "
-            f"불필요한 중첩 루프와 조건문을 제거하여 시간 복잡도를 줄이고 클린 코드로 리팩토링하세요."
-        )
+        refactoring_instruction = f"\n- [최적화] 순환 복잡도({max_complexity})를 낮추고 중첩 루프를 제거하세요."
 
     duplicate_instruction = ""
     if duplicate_snippets:
-        snippets_text = "\n\n".join(
-            f"[유사도 {d.get('similarity_score', 0):.2f}, 위치: {d.get('file_path')} "
-            f"({d.get('start_line')}~{d.get('end_line')}줄), 함수명: {d.get('function_name')}, "
-            f"매개변수: {', '.join(d.get('parameters') or [])}]\n{d.get('code')}"
-            for d in duplicate_snippets[:2]
-        )
-        duplicate_instruction = f"""
-    - [코드 재사용]: 아래는 이 프로젝트에 이미 존재하는 유사한 함수입니다.
-      가능하다면 원본 코드에서 중복되는 함수 정의를 제거하고, 아래 기존 함수를 import(또는 참조)하여
-      호출하는 방식으로 리팩토링하세요. 함수명과 매개변수 순서를 정확히 맞추세요.
-      기존 로직의 실제 동작 방식은 절대 변경하지 마세요.
+        snippets_text = "\n\n".join(f"[함수명: {d.get('function_name')}]\n{d.get('code')}" for d in duplicate_snippets[:2])
+        duplicate_instruction = f"\n- [코드 재사용] 다음 기존 함수를 활용해 중복을 제거하세요:\n{snippets_text}"
 
-      {snippets_text}
-    """
+    # 2. 히스토리 누적 (핵심 포인트!)
+    history_instruction = ""
+    if resolved_history:
+        res_str = "\n".join(f"  * {r}" for r in resolved_history)
+        history_instruction += f"\n[유지할 성공 내역 - 절대 원래대로 되돌리지 마세요]\n{res_str}\n"
+    if error_history:
+        err_str = "\n".join(f"  * {e}" for e in error_history)
+        history_instruction += f"\n[과거 오답 노트 - 똑같은 실수를 반복하지 마세요]\n{err_str}\n"
 
-    feedback_instruction = ""
-    if feedback:
-        resolved_text = f"\n[이전 시도에서 성공적으로 해결한 부분 - 절대 원래대로 되돌리지 마세요!]\n{resolved_feedback}" if resolved_feedback else ""
-        feedback_instruction = f"""
-    [이전 시도에서 발견된 문제점 - 반드시 이번엔 고쳐서 작성하세요]
-    {feedback}
-    {resolved_text}
-    [매우 중요] 위에 지적된 문제만 정확히 고치세요. 그 외의 나머지 부분
-    (이미 올바르게 작성된 import 문, SQL 쿼리, 괄호 구조, 변수명 등)은
-    이전 시도와 최대한 동일하게 유지하세요. 지적받지 않은 부분을
-    임의로 다시 바꾸거나 새로 작성하지 마세요.
-    """
+    # 3. 프롬프트 다이어트 (감정적 단어 제거, 우선순위 명시)
+    system_prompt = f"""You are a strict secure coding expert.
+[PRIORITIES & RULES]
+1. OUTPUT FORMAT: MUST return a valid JSON object. No markdown, no explanations outside JSON.
+2. SECURITY PATCH: Fix vulnerabilities. 
+   - DO NOT hardcode secrets (use System.getenv). 
+   - Use PreparedStatement and match the exact number of '?' with bound parameters. 
+   - Use SHA-256 instead of MD5.
+3. LOGIC PRESERVATION: Keep original business logic. (Removing sensitive logs is allowed).
+4. SYNTAX: Ensure perfectly balanced brackets and valid {lang_tag} syntax. Do not use 'try-with-resources' for Process objects.
 
-    lang_tag = (language or DEFAULT_LANGUAGE).lower()
-
-    system_prompt = f"""
-당신은 세계 최고의 보안 코딩 및 알고리즘 최적화 전문가입니다.
-사용자가 코드를 주면, 보안 취약점을 해결하고 리팩토링한 완성본 코드를 제공해야 합니다.
-[절대 규칙]
-- 로직의 원래 의미(비즈니스 로직)는 절대 변경하지 말고 구조만 개선하세요.
-- 단, 보안 취약점 해결이 비즈니스 로직 유지보다 무조건 최우선입니다.
-  (예: 패스워드나 민감 정보가 콘솔에 출력되는 로직이 있다면 원본 유지를 무시하고 해당 출력문을 완전히 삭제하세요. 
-  MD5 등 취약한 해시는 SHA-256 이상으로 반드시 교체하세요.)
-- 어떠한 경우에도 더미 데이터(예: "root", "1234")를 포함하여 비밀번호나 API 키를 코드에 하드코딩하지 마세요. 
-  반드시 환경 변수로 대체하세요.
-- 완벽하게 컴파일되는 정상적인 코드를 작성하세요. 특히 다음 실수를 절대 하지 마세요: 
-  세미콜론 누락, 오타, 클래스나 메서드를 닫는 중괄호가 실수로 하나 더 추가되는 것.
-- 절대 마크다운 헤더(#, ##), 설명 문단, 목록(1. 2. 3.) 등을 포함하지 마세요.
-- 절대 마크다운 코드 블록(백틱 3개)을 사용하지 마세요.
-- 문자열 리터럴은 여는 따옴표와 닫는 따옴표를 정확히 짝지으세요.
-- 중괄호와 괄호의 개수가 정확히 짝이 맞는지 스스로 확인하세요.
-- SQL 쿼리 파라미터 일치: 쿼리문의 물음표(?) 개수는 반드시 그 뒤에서 호출하는 
-  pstmt.setString()/setInt() 등의 총 호출 횟수와 정확히 같아야 합니다. 
-  예를 들어 pstmt.setString(1, ...)과 pstmt.setString(2, ...) 두 번을 호출한다면, 
-  쿼리문은 반드시 "INSERT INTO users(username, password) VALUES (?, ?)"처럼 
-  물음표가 정확히 2개 있어야 합니다.
-- import 문을 작성할 때는 그 언어의 표준 라이브러리에 실제로 존재하는 정확한 패키지 경로를 사용하세요.
-- [출력 포맷 엄수] JSON 객체 바깥에는 단 한 글자의 텍스트도 절대 출력하지 마세요. 
-  "Wait", "Self-correction", 참고 설명, 재확인 문구 등을 포함해 어떤 부연 설명도 
-  JSON 앞뒤에 붙이지 마세요. 오직 순수한 JSON 객체 하나만 출력하세요.
-- thought_process는 반드시 한 문장 이내로 짧게 작성하세요. 길게 서술하지 마세요.
-- 자신이 작성한 patched_code에 문법 오류가 없는지 응답을 제출하기 전에 마지막으로 다시 한번 확인하세요.
-- 반드시 아래와 같은 순수 JSON 형식으로만 응답하세요:
+[JSON SCHEMA]
 {{
-    "thought_process": "핵심 수정사항을 한 문장으로만 요약",
-    "patched_code": "여기에 완성된 {lang_tag} 코드 전체를 하나의 문자열로 작성 (줄바꿈은 \\n으로 표현, 쌍따옴표는 \\\"로 이스케이프)"
-}}
+    "thought_process": "Short 1-sentence summary of fixes",
+    "patched_code": "Complete patched code string, escaped properly for JSON"
+}}"""
+    
+    vuln_text = ""
+    if vulnerabilities:
+        for v in vulnerabilities:
+            rule_id = v.get("rule_id", "Unknown Rule")
+            line = v.get("line", "Unknown Line")
+            msg = v.get("message", "").replace('\n', ' ') # 줄바꿈 제거
+            vuln_text += f"- [Line {line}] {rule_id}: {msg}\n"
+    else:
+        vuln_text = "- 발견된 취약점 없음\n"
+
+    user_prompt = f"""[VULNERABILITIES]
+{vuln_text}
+[REQUESTS]{refactoring_instruction}{duplicate_instruction}
+{history_instruction}
+[ORIGINAL CODE]
+{original_code}
 """
 
-    user_prompt = f"""
-    [발견된 보안 취약점 리스트]
-    {json.dumps(vulnerabilities, ensure_ascii=False, indent=2)}
+    estimated_code_tokens = int(len(original_code) / 2.5)
+    sample_max_tokens = max(2048, min(int(estimated_code_tokens * 1.5) + 1024, 16384))
 
-    [수정 요청 사항]
-    - 발견된 보안 취약점(SQL Injection 등)을 완벽하게 패치하세요.{refactoring_instruction}{duplicate_instruction}
-    {feedback_instruction}
-    [원본 코드]
-    {original_code}
+    max_api_retries = 3
+    for api_attempt in range(max_api_retries):
+        try:
+            completion = client.chat.completions.create(
+                model="google/diffusiongemma-26b-a4b-it",
+                messages=[
+                    {"role": "system", "content": system_prompt.strip()},
+                    {"role": "user", "content": user_prompt.strip()}
+                ],
+                temperature=0.0,
+                max_tokens=sample_max_tokens,
+                stream=False,
+                timeout=45.0,  # [35번 해결] 무한 대기(Hang) 방지 (45초 제한)
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+            )
+            
+            # 성공 시 루프 탈출
+            break 
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            logger.warning(f"API 호출 실패 (시도 {api_attempt + 1}/{max_api_retries}): {error_msg}")
+            
+            if api_attempt == max_api_retries - 1:
+                logger.error("API 최대 재시도 횟수 초과. 코드 생성을 포기합니다.")
+                return ""
+            
+            # [36번 해결] Rate Limit (429) 또는 서버 과부하 시 지수 백오프 대기
+            if "429" in error_msg or "rate limit" in error_msg:
+                wait_time = 5 * (api_attempt + 1)
+                logger.info(f"Rate Limit 감지. {wait_time}초 대기 후 재시도합니다...")
+                time.sleep(wait_time)
+            else:
+                time.sleep(2) # 일반 에러는 2초 대기 후 재시도
 
-    반드시 JSON 형식으로만 응답하세요.
-    """
-
-    estimated_code_tokens = max(1, len(original_code) // 3)
-    expected_output_tokens = int(estimated_code_tokens * 1.3) + 512
-    sample_max_tokens = max(2048, min(expected_output_tokens, 16384))   # 상한도 늘림
-
-    completion = client.chat.completions.create(
-        model="google/diffusiongemma-26b-a4b-it",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        temperature=0.1,
-        top_p=0.1,
-        max_tokens=sample_max_tokens,
-        stream=False,
-        extra_body={
-            "chat_template_kwargs": {
-                "enable_thinking": False
-            }
-        }
-    )
-
+    # --- 이후 응답 처리 ---
     choice = completion.choices[0]
-    print(f"[DEBUG] finish_reason: {choice.finish_reason}")
+    if choice.finish_reason == "length":
+        logger.warning("Token length exceeded (finish_reason: length)")
 
     message_content = choice.message.content
-
-    if message_content is None:
+    if not message_content:
         reasoning_content = getattr(choice.message, 'reasoning', None)
         if reasoning_content:
-            print(f"[DEBUG] content는 None이지만 reasoning 필드에 내용이 있어 이를 사용합니다.")
             message_content = reasoning_content
         else:
-            print(f"[DEBUG] content와 reasoning 모두 비어있음. 전체 choice 객체: {choice}")
-            raise ValueError("모델이 빈 응답을 반환했습니다.")
+            return ""
 
-    raw_output = message_content.strip()   # if 블록 밖으로 뺌 (들여쓰기 수정)
-    print(f"[DEBUG] raw_output: {raw_output}")
-
+    raw_output = message_content.strip()
+    if raw_output.startswith("```"):
+        raw_output = raw_output.split("\n", 1)[-1]
+    if raw_output.endswith("```"):
+        raw_output = raw_output.rsplit("\n", 1)[0]
+        
+    logger.debug("API 통신 성공, 패치 코드 추출 시도")
     return _extract_patched_code(raw_output)
+
+logger = logging.getLogger(__name__)
 
 def verify_patched_code(patched_code: str, original_code: str, language: str) -> dict:
     """생성된 패치 코드가 문법적으로 유효하고 실행 가능한지 검증만 함 (직접 수정 안 함)"""
 
-    lang_tag = (language or DEFAULT_LANGUAGE).lower()
+    lang_tag = (language or "java").lower()
 
-    system_prompt = f"""
-    당신은 {lang_tag} 코드 품질 검수자입니다. 직접 수정하지 말고, 오직 평가만 하세요.
-    아래 [검토할 코드]가 다음 기준을 만족하는지 확인하세요:
+    system_prompt = f"""당신은 {lang_tag} 코드 품질 검수자입니다. 직접 수정하지 말고, 오직 평가만 하세요.
+아래 [검토할 코드]가 다음 기준을 만족하는지 확인하세요:
 
-    1. 문법 오류: 괄호/중괄호/따옴표가 정확히 짝이 맞는가? 컴파일 가능한 문법인가?
-    2. SQL 문법: SQL 쿼리가 있다면, 파라미터 자리표시자(?, 등)의 개수가
-       실제 바인딩되는 값의 개수와 정확히 일치하는가?
-    3. Import 경로: 모든 import 문이 실제로 존재하는 표준 라이브러리 경로를 정확히
-       가리키는가? (예: Java에서 암호화 관련 클래스는 javax.crypto 패키지에 있지 java.crypto가 아닙니다.)
-    4. 로직 보존: [원본 코드]의 핵심 기능(비즈니스 로직)이 그대로 유지되는가?
-    단, 보안 취약점을 해결하기 위한 다음과 같은 변화는 '로직 훼손'으로 간주하지 말고 
-    정상적인 개선으로 판단하여 통과(Pass) 시키세요:
-    - 민감한 정보(비밀번호, API 키 등)를 출력하는 로그를 삭제하거나 마스킹하는 것
-    - 취약한 해시 함수(MD5 등)를 안전한 함수(SHA-256 등)로 교체하는 것
-    - Statement를 PreparedStatement로 변경하여 SQL Injection을 방지하는 것
-    - 하드코딩된 자격 증명을 환경 변수 로드 방식으로 변경하는 것
+1. 문법 오류: 괄호/중괄호/따옴표가 정확히 짝이 맞는가? 컴파일 가능한 문법인가?
+2. SQL 문법: SQL 쿼리가 있다면, 파라미터 자리표시자(?, 등)의 개수가 실제 바인딩되는 값의 개수와 정확히 일치하는가?
+3. Import 경로: 모든 import 문이 실제로 존재하는 표준 라이브러리 경로를 정확히 가리키는가?
+4. 로직 보존: [원본 코드]의 핵심 기능(비즈니스 로직)이 그대로 유지되는가?
+   * 예외 허용: 보안 취약점 해결을 위한 민감 정보 로그 삭제, 안전한 해시 함수로 교체, PreparedStatement 변경, 하드코딩 제거는 '로직 훼손'이 아닙니다. 정상적인 개선으로 판단하여 통과(Pass) 시키세요.
 
-    문제가 없으면 {{"passed": true, "feedback": ""}}로 응답하세요.
-    문제가 있으면 {{"passed": false, "feedback": "정확히 어느 부분이 왜 문제인지 구체적으로 설명"}}으로 응답하세요.
-    반드시 순수 JSON으로만 응답하세요.
-    """
+[출력 형식]
+반드시 마크다운 없이 순수 JSON 객체 1개만 응답하세요. 내부 추론 과정이 있다면 JSON 바깥에 작성하거나 생략하고, 최종 결론만 JSON으로 출력하세요.
+- 통과 시: {{"passed": true, "feedback": ""}}
+- 실패 시: {{"passed": false, "feedback": "어느 부분이 문제인지 구체적인 설명"}}
+"""
 
-    user_prompt = f"""
-    [원본 코드]
-    {original_code}
+    user_prompt = f"""[원본 코드]
+{original_code}
 
-    [검토할 코드]
-    {patched_code}
+[검토할 코드]
+{patched_code}
 
-    위 기준으로 검토 결과를 JSON으로 응답하세요.
-    """
+위 기준으로 검토 결과를 JSON으로 응답하세요.
+"""
 
     try:
         completion = client.chat.completions.create(
-            model="google/diffusiongemma-26b-a4b-it",
+            model="poolside/laguna-xs-2.1",  # 💡 [변경] 평가자 모델 교체
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": user_prompt.strip()}
             ],
-            temperature=0.1,
-            top_p=0.1,
-            max_tokens=2048,
-            stream=False,
-            extra_body={
-                "chat_template_kwargs": {
-                    "enable_thinking": False
-                }
-            }
+            temperature=0.0,  # 💡 [변경] 평가의 일관성을 위해 창의성(랜덤성) 0% 고정
+            max_tokens=4096,  # 💡 [추가] Laguna 모델은 말이 길어질 수 있으므로 넉넉하게 4096
+            timeout=45.0      # 💡 [추가] 35번 문제 해결: 무한 대기(Hang) 방지
+            # 💡 top_p 제거 및 Gemma 전용 extra_body(enable_thinking) 제거
         )
 
         choice = completion.choices[0]
-        print(f"[DEBUG] verify_patched_code finish_reason: {choice.finish_reason}")
-
+        
+        # 응답 추출 방어 로직
         message_content = choice.message.content
-        if message_content is None:
+        if not message_content:
             reasoning_content = getattr(choice.message, 'reasoning', None)
             message_content = reasoning_content if reasoning_content else '{"passed": true, "feedback": ""}'
 
         raw_output = message_content.strip()
 
-        try:
-            parsed = json.loads(raw_output, strict=False)
-        except json.JSONDecodeError:
-            match = re.search(r'\{.*\}', raw_output, re.DOTALL)
-            parsed = json.loads(match.group(0), strict=False) if match else {"passed": False, "feedback": "평가자 응답 파싱 실패. 다시 시도하세요."}
+        # 💡 [변경] 강력한 JSON 정제 로직 (11, 13번 문제 해결 철학 반영)
+        # 1. 마크다운 블록 제거
+        cleaned = re.sub(r'```(?:json)?(.*?)```', r'\1', raw_output, flags=re.DOTALL).strip()
+        
+        # 2. 'Thinking...' 같은 텍스트가 앞에 올 경우를 대비해 스택으로 완벽한 JSON 추출
+        start_idx = cleaned.find('{')
+        if start_idx != -1:
+            cleaned = cleaned[start_idx:]
+            stack = []
+            end_idx = -1
+            for i, char in enumerate(cleaned):
+                if char == '{':
+                    stack.append(i)
+                elif char == '}':
+                    if stack:
+                        stack.pop()
+                        if not stack:
+                            end_idx = i
+                            break
+            if end_idx != -1:
+                cleaned = cleaned[:end_idx + 1]
 
-        return parsed
+        try:
+            parsed = json.loads(cleaned, strict=False)
+            return parsed
+        except json.JSONDecodeError:
+            logger.warning(f"[검증 파싱 실패] 원본 응답이 올바른 형식이 아닙니다: {raw_output[:100]}")
+            return {"passed": False, "feedback": "평가자 응답 파싱 실패 (JSON 포맷 에러). 코드를 다시 검증하세요."}
+
     except Exception as e:
-        print(f"코드 검증(실행가능성) 중 에러 발생: {e}")
+        logger.error(f"코드 검증 중 에러 발생: {e}")
         return {"passed": False, "feedback": "코드 검증 중 시스템 에러가 발생하여 실패 처리되었습니다."}
 
 def verify_issues_resolved(patched_code: str, original_code: str, vulnerabilities: list,
@@ -521,66 +581,115 @@ def verify_issues_resolved(patched_code: str, original_code: str, vulnerabilitie
         return {"passed": False, "feedback": "재사용성 검증 중 시스템 에러가 발생했습니다.", "resolved": resolved_so_far}
 
 def generate_patched_code(original_code, vulnerabilities, needs_refactoring=False,
-                           max_complexity=0, language=DEFAULT_LANGUAGE,
-                           duplicate_snippets=None, max_retries=4):
+                          max_complexity=0, language="java", duplicate_snippets=None):
+    
+    actual_retries = 5 if needs_refactoring else 3
+    
+    start_time = time.time()
     try:
-        feedback = None
-        resolved_feedback = None
+        error_history = []
+        resolved_history = []
         best_code = None
+        is_success = False  # 성공 여부를 추적하는 플래그 추가
+        
+        for attempt in range(actual_retries):
+            logger.info(f"====== [코드 생성] {attempt + 1}/{actual_retries}번째 시도 ======")
 
-        for attempt in range(max_retries + 1):
-            print(f"[코드 생성] {attempt + 1}번째 시도")
-
+            current_needs_refactoring = needs_refactoring if attempt < 2 else False
+            current_duplicate_snippets = duplicate_snippets if attempt < 2 else None
+            
             patched_code = draft_patched_code(
-                original_code, vulnerabilities, needs_refactoring,
-                max_complexity, language, duplicate_snippets, feedback, resolved_feedback
+                original_code, vulnerabilities, current_needs_refactoring,
+                max_complexity, language, current_duplicate_snippets, 
+                error_history, resolved_history
             )
 
-            # 1단계: 괄호/중괄호 체크
+            if not patched_code:
+                logger.warning(f"[{attempt + 1}차] 생성된 코드가 비어있어 파싱에 실패했습니다.")
+                error_history.append("API 응답 오류 또는 파싱 실패. 유효한 JSON 코드를 생성하세요.")
+                continue
+
+            local_error_msg = ""
             if not has_balanced_braces(patched_code):
-                feedback = "생성된 코드의 괄호 또는 중괄호 개수가 맞지 않습니다."
-                print(f"[코드 생성] {attempt + 1}번째 시도: 괄호 불균형 감지 - 재시도")
+                local_error_msg = "생성된 코드의 괄호 또는 중괄호 개수가 맞지 않습니다."
+            elif language.lower() == "java":
+                all_errors = check_known_import_errors(patched_code) + check_try_with_resources_errors(patched_code)
+                if all_errors:
+                    local_error_msg = "다음 문제가 있습니다: " + " ".join(all_errors)
+            
+            if local_error_msg:
+                error_history.append(local_error_msg)
+                logger.warning(f"[{attempt + 1}차] 로컬 문법/리소스 검증 실패: {local_error_msg}")
+                continue
+
+            syntax_review = verify_patched_code(patched_code, original_code, language)
+            if not syntax_review.get("passed", True):
+                syntax_err = syntax_review.get("feedback", "알 수 없는 문법 오류")
+                error_history.append(f"문법 오류: {syntax_err}")
+                logger.warning(f"[{attempt + 1}차] 평가자(Validator) 문법 검증 실패: {syntax_err}")
                 continue
 
             best_code = patched_code
 
-            # 2단계: import / try-with-resources 화이트리스트 체크
-            if language.lower() == "java":
-                import_errors = check_known_import_errors(patched_code)
-                twr_errors = check_try_with_resources_errors(patched_code)
-                all_errors = import_errors + twr_errors
-                if all_errors:
-                    feedback = "다음 문제가 있습니다: " + " ".join(all_errors)
-                    print(f"[코드 생성] {attempt + 1}번째 시도: import/리소스 오류 감지 - {feedback}")
-                    continue
-
-            # 3단계: 문법/실행가능성 검증 (LLM)
-            syntax_review = verify_patched_code(patched_code, original_code, language)
-            if not syntax_review.get("passed", True):
-                feedback = syntax_review.get("feedback", "")
-                print(f"[코드 생성] {attempt + 1}번째 시도 문법 검증 실패: {feedback}")
-                continue
-
-            # 4단계: 하이브리드 검증 (Semgrep + Lizard + LLM 재사용성) — verify_issues_resolved로 복원
             issue_review = verify_issues_resolved(
                 patched_code, original_code, vulnerabilities,
                 needs_refactoring, max_complexity, duplicate_snippets, language
             )
+            
             if issue_review.get("passed", True):
-                print(f"[코드 생성] {attempt + 1}번째 시도에서 모든 검증 통과")
-                return patched_code
+                logger.info(f"[{attempt + 1}차] 시도에서 모든 검증 통과")
+                is_success = True
+                break 
 
-            feedback = issue_review.get("feedback", "")
-            resolved_feedback = issue_review.get("resolved", "")
-            print(f"[해결 피드백] {attempt + 1}번째 시도 해결한 문제: {resolved_feedback}")
-            print(f"[코드 생성] {attempt + 1}번째 시도 문제해결 검증 실패: {feedback}")
+            issue_feedback = issue_review.get("feedback", "")
+            if issue_feedback:
+                error_history.append(f"보안 패치 미흡: {issue_feedback}")
+                
+            resolved_msg = issue_review.get("resolved", "")
+            if resolved_msg and resolved_msg not in resolved_history:
+                resolved_history.append(resolved_msg)
+                
+            logger.info(f"[{attempt + 1}차] 해결한 문제: {resolved_msg}")
+            logger.warning(f"[{attempt + 1}차] 문제해결 검증 실패: {issue_feedback}")
 
-        print("[코드 생성] 최대 재시도 횟수 도달, 마지막으로 최소 조건을 통과한 결과를 반환")
-        return best_code if best_code is not None else "보완 코드 생성에 실패했습니다."
+        if not is_success:
+            logger.warning("[코드 생성] 최대 재시도 횟수 도달. 마지막으로 컴파일을 통과한 코드를 반환합니다.")
+            
+        elapsed_time = round(time.time() - start_time, 2)
+    
+        # [45번 해결] 성공/실패와 무관하게 항상 일관된 포맷 반환
+        result_payload = {
+            "status": "success" if is_success else "fail",
+            "final_code": best_code if best_code else "보완 코드 생성에 실패했습니다.",
+            "metrics": {
+                "attempts_used": attempt + 1,
+                "max_retries": actual_retries,
+                "elapsed_seconds": elapsed_time,
+                "error_history_count": len(error_history)
+            }
+        }
+        
+        # [43번 해결] 통계 로그 기록
+        with open("patch_analytics.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "timestamp": time.time(),
+                "language": language,
+                "vulnerability_count": len(vulnerabilities),
+                "status": result_payload["status"],
+                "attempts": result_payload["metrics"]["attempts_used"],
+                "elapsed_seconds": elapsed_time
+            }) + "\n")
+            
+        return result_payload
 
     except Exception as e:
-        print(f"코드 생성 중 에러 발생: {e}")
-        return "보완 코드 생성에 실패했습니다."
+        logger.error(f"코드 생성 중 치명적 에러 발생: {e}", exc_info=True)
+        # 💡 [수정 3] 예외 발생 시에도 메인 시스템이 뻗지 않도록 동일한 딕셔너리 구조 반환
+        return {
+            "status": "error",
+            "final_code": "보완 코드 생성 중 치명적 오류가 발생했습니다.",
+            "metrics": {"attempts_used": 0, "elapsed_seconds": 0}
+        }
 
 def summarize_function(function_info: dict) -> str:
     """재사용 후보 함수 하나를, 다른 AI가 참고할 수 있는 자연어 설명으로 요약"""
@@ -1053,6 +1162,8 @@ async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResp
         max_complexity=security_result["max_complexity"],
         needs_refactoring=security_result["needs_refactoring"],
         complexity_details=security_result.get("complexity_details", []),
-        patched_code=security_result["patched_code"],
+        patched_code=security_result["patched_code"].get("final_code", "보완 코드 생성 실패") 
+                     if isinstance(security_result["patched_code"], dict) 
+                     else security_result["patched_code"],
         duplicate_snippets=request.duplicate_snippets or []
     )
