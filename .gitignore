@@ -237,6 +237,7 @@ datasets/
 logs/
 
 # Local environment files
+.env
 .env.*
 !.env.example
 
@@ -244,4 +245,4 @@ logs/
 faiss_indexes/*.index
 
 #모델 파일 안 올라가게
-"app/models/"
+app/models/
