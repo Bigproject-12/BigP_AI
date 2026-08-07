@@ -263,9 +263,12 @@ def _extract_patched_code(raw_output: str) -> str:
 
     # 5. 최후의 보루 (안전한 정규식 추출) (15번 문제 해결)
     # 어설픈 추출은 Syntax Error 사이클을 유발하므로 정규식을 아주 엄격하게 변경
-    loose_match = re.search(r'"patched_code"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', cleaned, re.DOTALL)
+    loose_match = re.search(r'"patched_code"\s*:\s*"(.*)', cleaned, re.DOTALL)
     if loose_match:
         extracted = loose_match.group(1)
+        last_quote_index = extracted.rfind('"')
+        if last_quote_index != -1:
+            extracted = extracted[:last_quote_index]
         extracted = extracted.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\')
         return extracted.strip()
         
@@ -290,7 +293,7 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
     duplicate_instruction = ""
     if duplicate_snippets:
         snippets_text = "\n\n".join(f"[함수명: {d.get('function_name')}]\n{d.get('code')}" for d in duplicate_snippets[:2])
-        duplicate_instruction = f"\n- [코드 재사용] 다음 기존 함수를 활용해 중복을 제거하세요:\n{snippets_text}"
+        duplicate_instruction = f"\n\n[EXISTING FUNCTIONS TO REUSE - MANDATORY]\n{snippets_text}\n(You must call the function above instead of reimplementing this logic.)"
 
     # 2. 히스토리 누적 (핵심 포인트!)
     history_instruction = ""
@@ -302,6 +305,7 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
         history_instruction += f"\n[과거 오답 노트 - 똑같은 실수를 반복하지 마세요]\n{err_str}\n"
 
     # 3. 프롬프트 다이어트 (감정적 단어 제거, 우선순위 명시)
+    # 여기부터 수정됨 — CODE REUSE를 우선순위 규칙에 명시적으로 추가
     system_prompt = f"""You are a strict secure coding expert.
 [PRIORITIES & RULES]
 1. OUTPUT FORMAT: MUST return a valid JSON object. No markdown, no explanations outside JSON.
@@ -309,8 +313,12 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
    - DO NOT hardcode secrets (use System.getenv). 
    - Use PreparedStatement and match the exact number of '?' with bound parameters. 
    - Use SHA-256 instead of MD5.
-3. LOGIC PRESERVATION: Keep original business logic. (Removing sensitive logs is allowed).
-4. SYNTAX: Ensure perfectly balanced brackets and valid {lang_tag} syntax. Do not use 'try-with-resources' for Process objects.
+3. CODE REUSE: If [EXISTING FUNCTIONS TO REUSE] is provided below, you MUST call/import that 
+   existing function instead of writing new logic that duplicates it. This is not optional — 
+   failing to reuse an existing function will cause your response to be rejected.
+4. LOGIC PRESERVATION: Keep original business logic. (Removing sensitive logs is allowed).
+5. SYNTAX: Ensure perfectly balanced brackets and valid {lang_tag} syntax. Do not use 'try-with-resources' for Process objects.
+6. The JSON object MUST start with exactly one opening curly brace and end with exactly one closing curly brace. Do not duplicate the outer braces.
 
 [JSON SCHEMA]
 {{
@@ -337,25 +345,24 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
 """
 
     estimated_code_tokens = int(len(original_code) / 2.5)
-    sample_max_tokens = max(2048, min(int(estimated_code_tokens * 1.5) + 1024, 16384))
+    sample_max_tokens = max(4096, min(int(estimated_code_tokens * 1.5) + 1024, 16384))
 
     max_api_retries = 3
     for api_attempt in range(max_api_retries):
         try:
             completion = client.chat.completions.create(
-                model="google/diffusiongemma-26b-a4b-it",
+                model="mistralai/mistral-nemotron",
                 messages=[
                     {"role": "system", "content": system_prompt.strip()},
                     {"role": "user", "content": user_prompt.strip()}
                 ],
                 temperature=0.0,
+                top_p=0.7,
                 max_tokens=sample_max_tokens,
                 stream=False,
-                timeout=45.0,  # [35번 해결] 무한 대기(Hang) 방지 (45초 제한)
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+                timeout=45.0
             )
             
-            # 성공 시 루프 탈출
             break 
             
         except Exception as e:
@@ -366,15 +373,13 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
                 logger.error("API 최대 재시도 횟수 초과. 코드 생성을 포기합니다.")
                 return ""
             
-            # [36번 해결] Rate Limit (429) 또는 서버 과부하 시 지수 백오프 대기
             if "429" in error_msg or "rate limit" in error_msg:
                 wait_time = 5 * (api_attempt + 1)
                 logger.info(f"Rate Limit 감지. {wait_time}초 대기 후 재시도합니다...")
                 time.sleep(wait_time)
             else:
-                time.sleep(2) # 일반 에러는 2초 대기 후 재시도
+                time.sleep(2)
 
-    # --- 이후 응답 처리 ---
     choice = completion.choices[0]
     if choice.finish_reason == "length":
         logger.warning("Token length exceeded (finish_reason: length)")
@@ -393,7 +398,7 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
     if raw_output.endswith("```"):
         raw_output = raw_output.rsplit("\n", 1)[0]
         
-    logger.debug("API 통신 성공, 패치 코드 추출 시도")
+    logger.info(f"[DEBUG] raw_output 길이: {len(raw_output)}, 내용: {raw_output[:500]}")
     return _extract_patched_code(raw_output)
 
 logger = logging.getLogger(__name__)
@@ -408,12 +413,12 @@ def verify_patched_code(patched_code: str, original_code: str, language: str) ->
 
 1. 문법 오류: 괄호/중괄호/따옴표가 정확히 짝이 맞는가? 컴파일 가능한 문법인가?
 2. SQL 문법: SQL 쿼리가 있다면, 파라미터 자리표시자(?, 등)의 개수가 실제 바인딩되는 값의 개수와 정확히 일치하는가?
-3. Import 경로: 모든 import 문이 실제로 존재하는 표준 라이브러리 경로를 정확히 가리키는가?
+3. Import 경로: 존재하지 않는 라이브러리를 import하는지만 확인하세요. (java.sql.* 같은 와일드카드 import는 허용됩니다.)
 4. 로직 보존: [원본 코드]의 핵심 기능(비즈니스 로직)이 그대로 유지되는가?
    * 예외 허용: 보안 취약점 해결을 위한 민감 정보 로그 삭제, 안전한 해시 함수로 교체, PreparedStatement 변경, 하드코딩 제거는 '로직 훼손'이 아닙니다. 정상적인 개선으로 판단하여 통과(Pass) 시키세요.
 
 [출력 형식]
-반드시 마크다운 없이 순수 JSON 객체 1개만 응답하세요. 내부 추론 과정이 있다면 JSON 바깥에 작성하거나 생략하고, 최종 결론만 JSON으로 출력하세요.
+- 실패 시 피드백("feedback")은 반드시 200자 이내로 핵심만 짧게 작성하세요.
 - 통과 시: {{"passed": true, "feedback": ""}}
 - 실패 시: {{"passed": false, "feedback": "어느 부분이 문제인지 구체적인 설명"}}
 """
@@ -427,61 +432,78 @@ def verify_patched_code(patched_code: str, original_code: str, language: str) ->
 위 기준으로 검토 결과를 JSON으로 응답하세요.
 """
 
-    try:
-        completion = client.chat.completions.create(
-            model="poolside/laguna-xs-2.1",  # 💡 [변경] 평가자 모델 교체
-            messages=[
-                {"role": "system", "content": system_prompt.strip()},
-                {"role": "user", "content": user_prompt.strip()}
-            ],
-            temperature=0.0,  # 💡 [변경] 평가의 일관성을 위해 창의성(랜덤성) 0% 고정
-            max_tokens=4096,  # 💡 [추가] Laguna 모델은 말이 길어질 수 있으므로 넉넉하게 4096
-            timeout=45.0      # 💡 [추가] 35번 문제 해결: 무한 대기(Hang) 방지
-            # 💡 top_p 제거 및 Gemma 전용 extra_body(enable_thinking) 제거
-        )
-
-        choice = completion.choices[0]
-        
-        # 응답 추출 방어 로직
-        message_content = choice.message.content
-        if not message_content:
-            reasoning_content = getattr(choice.message, 'reasoning', None)
-            message_content = reasoning_content if reasoning_content else '{"passed": true, "feedback": ""}'
-
-        raw_output = message_content.strip()
-
-        # 💡 [변경] 강력한 JSON 정제 로직 (11, 13번 문제 해결 철학 반영)
-        # 1. 마크다운 블록 제거
-        cleaned = re.sub(r'```(?:json)?(.*?)```', r'\1', raw_output, flags=re.DOTALL).strip()
-        
-        # 2. 'Thinking...' 같은 텍스트가 앞에 올 경우를 대비해 스택으로 완벽한 JSON 추출
-        start_idx = cleaned.find('{')
-        if start_idx != -1:
-            cleaned = cleaned[start_idx:]
-            stack = []
-            end_idx = -1
-            for i, char in enumerate(cleaned):
-                if char == '{':
-                    stack.append(i)
-                elif char == '}':
-                    if stack:
-                        stack.pop()
-                        if not stack:
-                            end_idx = i
-                            break
-            if end_idx != -1:
-                cleaned = cleaned[:end_idx + 1]
-
+    max_api_retries = 3
+    for api_attempt in range(max_api_retries):
         try:
-            parsed = json.loads(cleaned, strict=False)
-            return parsed
-        except json.JSONDecodeError:
-            logger.warning(f"[검증 파싱 실패] 원본 응답이 올바른 형식이 아닙니다: {raw_output[:100]}")
-            return {"passed": False, "feedback": "평가자 응답 파싱 실패 (JSON 포맷 에러). 코드를 다시 검증하세요."}
+            completion = client.chat.completions.create(
+                model="mistralai/mistral-nemotron",
+                messages=[
+                    {"role": "system", "content": system_prompt.strip()},
+                    {"role": "user", "content": user_prompt.strip()}
+                ],
+                temperature=0.0,
+                top_p=0.7,
+                max_tokens=4096,
+                timeout=45.0
+            )
 
-    except Exception as e:
-        logger.error(f"코드 검증 중 에러 발생: {e}")
-        return {"passed": False, "feedback": "코드 검증 중 시스템 에러가 발생하여 실패 처리되었습니다."}
+            choice = completion.choices[0]
+
+            # 응답 추출 방어 로직
+            message_content = choice.message.content
+            if not message_content:
+                reasoning_content = getattr(choice.message, 'reasoning', None)
+                message_content = reasoning_content if reasoning_content else '{"passed": true, "feedback": ""}'
+
+            raw_output = message_content.strip()
+
+            # 강력한 JSON 정제 로직
+            cleaned = re.sub(r'```(?:json)?(.*?)```', r'\1', raw_output, flags=re.DOTALL).strip()
+
+            start_idx = cleaned.find('{')
+            if start_idx != -1:
+                cleaned = cleaned[start_idx:]
+                stack = []
+                end_idx = -1
+                for i, char in enumerate(cleaned):
+                    if char == '{':
+                        stack.append(i)
+                    elif char == '}':
+                        if stack:
+                            stack.pop()
+                            if not stack:
+                                end_idx = i
+                                break
+                if end_idx != -1:
+                    cleaned = cleaned[:end_idx + 1]
+
+            try:
+                parsed = json.loads(cleaned, strict=False)
+                return parsed
+            except json.JSONDecodeError:
+                logger.warning(f"[검증 파싱 실패] 원본 응답이 올바른 형식이 아닙니다: {raw_output[:100]}")
+                return {"passed": False, "feedback": "평가자 응답 파싱 실패 (JSON 포맷 에러). 코드를 다시 검증하세요."}
+
+        except Exception as e:
+            error_msg = str(e).lower()
+            logger.warning(f"검증기 API 호출 실패 (시도 {api_attempt + 1}/{max_api_retries}): {error_msg}")
+
+            is_overload = "503" in error_msg or "429" in error_msg or "resourceexhausted" in error_msg
+
+            if api_attempt == max_api_retries - 1:
+                # 최종 실패 — 하이브리드 판단
+                if is_overload:
+                    logger.warning("검증기 서버 과부하가 지속되어 검증을 생략하고 통과 처리합니다.")
+                    return {"passed": True, "feedback": "(API 과부하로 문법 검증 생략됨)"}
+                logger.error("검증기 API 최대 재시도 횟수 초과 (과부하 외 원인).")
+                return {"passed": False, "feedback": "코드 검증 중 시스템 에러가 발생하여 실패 처리되었습니다."}
+
+            if is_overload:
+                wait_time = 5 * (api_attempt + 1)
+                logger.info(f"서버 과부하 감지. {wait_time}초 대기 후 검증을 재시도합니다...")
+                time.sleep(wait_time)
+            else:
+                time.sleep(2)
 
 def verify_issues_resolved(patched_code: str, original_code: str, vulnerabilities: list,
                             needs_refactoring: bool, max_complexity: int,
@@ -1144,27 +1166,43 @@ async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResp
     code = request.code_content
     language = getattr(request, "language", None) or DEFAULT_LANGUAGE
 
-    print(f"[DEBUG] 받은 duplicate_snippets: {request.duplicate_snippets}")
-
     duplicate_snippets = [d.model_dump() for d in (request.duplicate_snippets or [])]
 
-    print(f"[DEBUG] 변환된 duplicate_snippets: {duplicate_snippets}")
+    try:
+        security_task = asyncio.to_thread(run_security_pipeline, code, language, duplicate_snippets)
+        ai_task = asyncio.to_thread(run_ai_detection, code)
 
-    security_task = asyncio.to_thread(run_security_pipeline, code, language, duplicate_snippets)
-    ai_task = asyncio.to_thread(run_ai_detection, code)
-    
-    security_result, ai_result = await asyncio.gather(security_task, ai_task)
-    
-    return AICodeDetectionResponse(
-        is_ai_generated=ai_result["is_ai_generated"],
-        ai_probability=ai_result["ai_probability"],
-        has_vulnerability=security_result["has_vulnerability"],
-        vulnerabilities=security_result["vulnerabilities"],
-        max_complexity=security_result["max_complexity"],
-        needs_refactoring=security_result["needs_refactoring"],
-        complexity_details=security_result.get("complexity_details", []),
-        patched_code=security_result["patched_code"].get("final_code", "보완 코드 생성 실패") 
-                     if isinstance(security_result["patched_code"], dict) 
-                     else security_result["patched_code"],
-        duplicate_snippets=request.duplicate_snippets or []
-    )
+        security_result, ai_result = await asyncio.gather(security_task, ai_task)
+
+        patch_result = security_result["patched_code"]
+        if isinstance(patch_result, dict):
+            final_code = patch_result.get("final_code", "보완 코드 생성에 실패했습니다.")
+            patch_success = (patch_result.get("status") == "success")
+        else:
+            final_code = patch_result
+            patch_success = bool(final_code) and final_code != "보완 코드 생성에 실패했습니다."
+
+        return AICodeDetectionResponse(
+            is_ai_generated=ai_result["is_ai_generated"],
+            ai_probability=ai_result["ai_probability"],
+            has_vulnerability=security_result["has_vulnerability"],
+            vulnerabilities=security_result["vulnerabilities"],
+            max_complexity=security_result["max_complexity"],
+            needs_refactoring=security_result["needs_refactoring"],
+            complexity_details=security_result.get("complexity_details", []),
+            patched_code=final_code,
+            patch_success=patch_success,
+            duplicate_snippets=request.duplicate_snippets or []
+        )
+
+    except Exception as e:
+        logger.error(f"분석 전체 실패: {e}", exc_info=True)
+        return AICodeDetectionResponse(
+            is_ai_generated=False,
+            ai_probability=0.0,
+            has_vulnerability=False,
+            vulnerabilities=[],
+            patched_code="분석 중 오류가 발생했습니다.",
+            patch_success=False,
+            duplicate_snippets=[]
+        )

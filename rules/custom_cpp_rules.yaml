@@ -53,9 +53,28 @@ rules:
       - pattern-either:
           - pattern: std::cout << $VAR
           - pattern: printf("...", $VAR)
+      - pattern-not: std::cout << $FUNC(...)
+      - pattern-not: printf("...", $FUNC(...))
       - metavariable-regex:
           metavariable: $VAR
           regex: (?i).*(password|secret|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
+
+  - id: guardrail-cpp-sensitive-log-via-function
+    languages: [cpp]
+    severity: ERROR
+    message: >
+      A function whose name suggests it returns sensitive information (getPassword,
+      getSecret, etc.) is being printed to console/stream.
+    patterns:
+      - pattern-either:
+          - pattern: std::cout << $FUNC(...)
+          - pattern: printf("...", $FUNC(...))
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: (?i).*(getpassword|getsecret|gettoken|getcredential).*
     metadata:
       category: security
       cwe: "CWE-532: Insertion of Sensitive Information into Log File"

@@ -1,16 +1,23 @@
 ﻿using System;
-using System.Data.SqlClient;
 
-public class TestCode
+public class Test
 {
-    private const string API_SECRET = "hardcoded_secret_123";
-    static readonly string DB_PASSWORD = Environment.GetEnvironmentVariable("DB_PASSWORD") ?? "1234";
+    private const string PASSWORD = "1234";
 
-    public void Login(string username, string password)
+    public static string GetPassword()
     {
-        Console.WriteLine("Password entered: " + password);
+        return PASSWORD;
+    }
 
-        string query = "SELECT * FROM users WHERE username='" + username + "'";
-        SqlCommand cmd = new SqlCommand(query, null);
+    public static string HashIt(string p)
+    {
+        return p.GetHashCode().ToString();
+    }
+
+    public static void Main()
+    {
+        Console.WriteLine("Password: " + PASSWORD);
+        Console.WriteLine(HashIt(PASSWORD));
+        Console.WriteLine(GetPassword());
     }
 }
