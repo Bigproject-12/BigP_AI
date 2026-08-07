@@ -1,13 +1,21 @@
 ﻿#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
-char *api_secret = "hardcoded_secret_123";
+char *password = "1234";
 
-void login(char *username, char *password) {
-    printf("Password entered: %s", password);
+char *get_password() {
+    return password;
+}
 
-    char cmd[100];
-    sprintf(cmd, "ls -la %s", username);
-    system(cmd);
+char *hash_it(char *p) {
+    static char buf[32];
+    sprintf(buf, "hashed_%s", p);
+    return buf;
+}
+
+int main() {
+    printf("Password: %s\n", password);
+    printf("%s\n", hash_it(password));
+    printf("%s\n", get_password());
+    return 0;
 }

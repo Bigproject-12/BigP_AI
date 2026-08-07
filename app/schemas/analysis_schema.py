@@ -30,6 +30,7 @@ class AICodeDetectionResponse(BaseModel):
     needs_refactoring: Optional[bool] = False
     complexity_details: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="복잡도 임계치를 초과한 함수들의 상세 내역 (함수명, 점수, 라인, 메시지)")
     patched_code: Optional[str] = None
+    patch_success: bool = True
     duplicate_snippets: Optional[List[DuplicateSnippet]] = Field(default_factory=list)
 
 class PromptReconstructRequest(BaseModel):

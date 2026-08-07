@@ -63,14 +63,33 @@ rules:
     severity: ERROR
     message: >
       A variable whose name suggests sensitive information (password, secret, token)
-      is being printed to console. This can leak credentials into log files.
+      is being printed directly to console. This can leak credentials into log files.
     patterns:
       - pattern-either:
           - pattern: printf("...", $VAR)
           - pattern: fprintf($FP, "...", $VAR)
+      - pattern-not: printf("...", $FUNC(...))
+      - pattern-not: fprintf($FP, "...", $FUNC(...))
       - metavariable-regex:
           metavariable: $VAR
           regex: (?i).*(password|secret|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
+
+  - id: guardrail-c-sensitive-log-via-function
+    languages: [c]
+    severity: ERROR
+    message: >
+      A function whose name suggests it returns sensitive information (getPassword,
+      getSecret, etc.) is being printed directly to console.
+    patterns:
+      - pattern-either:
+          - pattern: printf("...", $FUNC(...))
+          - pattern: fprintf($FP, "...", $FUNC(...))
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: (?i).*(get_?password|get_?secret|get_?token|get_?credential).*
     metadata:
       category: security
       cwe: "CWE-532: Insertion of Sensitive Information into Log File"

@@ -1,12 +1,19 @@
 ﻿#include <iostream>
-#include <cstdlib>
-#include <cstdio>
+#include <string>
 
-const std::string API_SECRET = "hardcoded_secret_123";
+std::string password = "1234";
 
-void login(const char* username, const char* password) {
-    std::cout << "Password entered: " << password << std::endl;
+std::string getPassword() {
+    return password;
+}
 
-    std::string cmd = "ls -la " + std::string(username);
-    system(cmd.c_str());
+std::string hashIt(std::string p) {
+    return std::to_string(std::hash<std::string>{}(p));
+}
+
+int main() {
+    std::cout << "Password: " << password << std::endl;
+    std::cout << hashIt(password) << std::endl;
+    std::cout << getPassword() << std::endl;
+    return 0;
 }

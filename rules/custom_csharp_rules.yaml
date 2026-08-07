@@ -62,14 +62,33 @@ rules:
     severity: ERROR
     message: >
       A variable whose name suggests sensitive information (password, secret, token)
-      is being printed to console. This can leak credentials into log files.
+      is being printed directly to console. This can leak credentials into log files.
     patterns:
       - pattern-either:
           - pattern: Console.WriteLine("..." + $VAR)
           - pattern: Console.WriteLine($VAR)
+      - pattern-not: Console.WriteLine("..." + $FUNC(...))
+      - pattern-not: Console.WriteLine($FUNC(...))
       - metavariable-regex:
           metavariable: $VAR
           regex: (?i).*(password|secret|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
+
+  - id: guardrail-csharp-sensitive-log-via-function
+    languages: [csharp]
+    severity: ERROR
+    message: >
+      A function whose name suggests it returns sensitive information (GetPassword,
+      GetSecret, etc.) is being printed directly to console.
+    patterns:
+      - pattern-either:
+          - pattern: Console.WriteLine("..." + $FUNC(...))
+          - pattern: Console.WriteLine($FUNC(...))
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: (?i).*(getpassword|getsecret|gettoken|getcredential).*
     metadata:
       category: security
       cwe: "CWE-532: Insertion of Sensitive Information into Log File"
