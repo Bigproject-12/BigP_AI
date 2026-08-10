@@ -36,6 +36,9 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+# Exported Docker images
+*.tar.gz
+
 # Unit test / coverage reports
 htmlcov/
 .tox/

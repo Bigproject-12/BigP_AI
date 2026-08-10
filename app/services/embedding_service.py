@@ -13,9 +13,9 @@ FAISS_INDEX_DIR = "./app/faiss_indexes"
 DIMENSION = 1024   # 768 → 1024로 변경
 
 # ===== S3 모델 자동 다운로드 설정 =====
-S3_BUCKET = "guardrail-codebert-models-v1"
-CODESAGE_S3_KEY = "codesage-small/model.safetensors"
-AWS_REGION = "ap-southeast-1"
+S3_BUCKET = os.getenv("MODEL_S3_BUCKET", "guardrail-codebert-models-v1")
+CODESAGE_S3_KEY = os.getenv("CODESAGE_S3_KEY", "codesage-small/model.safetensors")
+AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 
 
 def download_codesage_model_if_needed():

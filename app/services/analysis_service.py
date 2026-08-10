@@ -21,9 +21,9 @@ client = OpenAI(
 MODEL_PATH = "./app/models/codebart"
 MODEL_FILE = os.path.join(MODEL_PATH, "model.safetensors") 
 
-S3_BUCKET = "guardrail-codebert-models-v1"
-S3_KEY = "codebart/model.safetensors"
-AWS_REGION = "ap-southeast-1"
+S3_BUCKET = os.getenv("MODEL_S3_BUCKET", "guardrail-codebert-models-v1")
+S3_KEY = os.getenv("CODEBART_S3_KEY", "codebart/model.safetensors")
+AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 
 LANGUAGE_CONFIG = {
     "java": {"semgrep_configs": ["p/java", "./rules/custom_java_rules.yaml"], "extension": ".java"},

@@ -15,7 +15,8 @@ app.include_router(analysis_router.router, prefix="/api/ai", tags=["AI Code Anal
 app.include_router(embedding_router.router, prefix="/api/embedding", tags=["Code Embedding"])
 
 origins = [
-    "http://localhost:5173",
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGIN", "http://localhost:5173").split(",")
 ]
 
 app.add_middleware(
