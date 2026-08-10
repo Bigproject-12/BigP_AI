@@ -14,6 +14,11 @@ import time
 import logging
 import functools
 
+from google import genai
+from google.genai import types
+
+gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
 client = OpenAI(
   base_url = os.getenv("NVIDIA_BASE_URL"),
   api_key = os.getenv("NVIDIA_API_KEY"),
@@ -281,6 +286,7 @@ logger = logging.getLogger(__name__)
 def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactoring: bool,
                        max_complexity: int, language: str, duplicate_snippets: list,
                        error_history: list = None, resolved_history: list = None,
+                       previous_code: str = None,
                        attempt_num: int = None) -> str:
     """패치 코드 초안 생성. error_history 배열을 통해 이전 실패 원인을 누적 반영"""
 
@@ -288,7 +294,6 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
 
     lang_tag = (language or "java").lower()
 
-    # 1. 추가 지시사항 조립 (간결화)
     refactoring_instruction = ""
     if needs_refactoring:
         refactoring_instruction = f"\n- [최적화] 순환 복잡도({max_complexity})를 낮추고 중첩 루프를 제거하세요."
@@ -298,7 +303,6 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
         snippets_text = "\n\n".join(f"[함수명: {d.get('function_name')}]\n{d.get('code')}" for d in duplicate_snippets[:2])
         duplicate_instruction = f"\n\n[EXISTING FUNCTIONS TO REUSE - MANDATORY]\n{snippets_text}\n(You must call the function above instead of reimplementing this logic.)"
 
-    # 2. 히스토리 누적 (핵심 포인트!)
     history_instruction = ""
     if resolved_history:
         res_str = "\n".join(f"  * {r}" for r in resolved_history)
@@ -307,18 +311,18 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
         err_str = "\n".join(f"  * {e}" for e in error_history)
         history_instruction += f"\n[과거 오답 노트 - 똑같은 실수를 반복하지 마세요]\n{err_str}\n"
 
-    # 로그 추가: 이번 시도에 실제로 어떤 지시사항이 실려 나가는지 확인
     logger.info(f"{tag} needs_refactoring={needs_refactoring}, "
                 f"duplicate_snippets={len(duplicate_snippets) if duplicate_snippets else 0}개, "
                 f"error_history={len(error_history) if error_history else 0}개, "
-                f"resolved_history={len(resolved_history) if resolved_history else 0}개")
+                f"resolved_history={len(resolved_history) if resolved_history else 0}개, "
+                f"previous_code={'있음' if previous_code else '없음'}")
     if error_history:
         logger.info(f"{tag} 이번에 전달되는 오답노트: {error_history}")
 
-    # 3. 프롬프트 다이어트 (감정적 단어 제거, 우선순위 명시)
     system_prompt = f"""You are a strict secure coding expert.
 [PRIORITIES & RULES]
 1. OUTPUT FORMAT: MUST return a valid JSON object. No markdown, no explanations outside JSON.
+   Do not write any commentary, self-correction, or "Wait, I noticed..." text before or after the JSON.
 2. SECURITY PATCH: Fix vulnerabilities. 
    - DO NOT hardcode secrets (use System.getenv). 
    - Use PreparedStatement and match the exact number of '?' with bound parameters. 
@@ -329,6 +333,12 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
 4. LOGIC PRESERVATION: Keep original business logic. (Removing sensitive logs is allowed).
 5. SYNTAX: Ensure perfectly balanced brackets and valid {lang_tag} syntax. Do not use 'try-with-resources' for Process objects.
 6. The JSON object MUST start with exactly one opening curly brace and end with exactly one closing curly brace. Do not duplicate the outer braces.
+7. IF [YOUR PREVIOUS ATTEMPT] IS PROVIDED: Do NOT rewrite the code from scratch. Start from that 
+   exact code and make the MINIMAL change needed to fix only what [ISSUES TO FIX] describes. 
+   Keep every other line identical to the previous attempt.
+8. When a regex string like "\r?\n" needs to appear inside the JSON "patched_code" value, 
+   write it EXACTLY as \\r?\\n (four characters: backslash, r, question mark, backslash, backslash, n) 
+   so it survives JSON parsing correctly.
 
 [JSON SCHEMA]
 {{
@@ -341,17 +351,28 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
         for v in vulnerabilities:
             rule_id = v.get("rule_id", "Unknown Rule")
             line = v.get("line", "Unknown Line")
-            msg = v.get("message", "").replace('\n', ' ') # 줄바꿈 제거
+            msg = v.get("message", "").replace('\n', ' ')
             vuln_text += f"- [Line {line}] {rule_id}: {msg}\n"
     else:
         vuln_text = "- 발견된 취약점 없음\n"
+
+    if previous_code:
+        base_code_section = f"""[YOUR PREVIOUS ATTEMPT - fix only the issues below, keep everything else identical]
+{previous_code}
+
+[ISSUES TO FIX IN THE ABOVE CODE]
+{chr(10).join(f'  * {e}' for e in error_history) if error_history else '(none)'}
+"""
+    else:
+        base_code_section = f"""[ORIGINAL CODE]
+{original_code}
+"""
 
     user_prompt = f"""[VULNERABILITIES]
 {vuln_text}
 [REQUESTS]{refactoring_instruction}{duplicate_instruction}
 {history_instruction}
-[ORIGINAL CODE]
-{original_code}
+{base_code_section}
 """
 
     estimated_code_tokens = int(len(original_code) / 2.5)
@@ -360,68 +381,56 @@ def draft_patched_code(original_code: str, vulnerabilities: list, needs_refactor
     max_api_retries = 3
     for api_attempt in range(max_api_retries):
         try:
-            completion = client.chat.completions.create(
-                model="google/diffusiongemma-26b-a4b-it",
-                messages=[
-                    {"role": "system", "content": system_prompt.strip()},
-                    {"role": "user", "content": user_prompt.strip()}
-                ],
-                temperature=0.0,
-                top_p=0.7,
-                max_tokens=sample_max_tokens,
-                stream=False,
-                timeout=45.0
+            response = gemini_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=user_prompt.strip(),
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt.strip(),
+                    temperature=0.0,
+                    max_output_tokens=sample_max_tokens,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
             )
-            
-            break 
-            
+
+            finish_reason = response.candidates[0].finish_reason if response.candidates else None
+            logger.info(f"{tag} finish_reason={finish_reason}")
+
+            raw_output = response.text
+            if not raw_output:
+                logger.warning(f"{tag} response.text가 비어있음")
+                return ""
+
+            raw_output = raw_output.strip()
+            if raw_output.startswith("```"):
+                raw_output = raw_output.split("\n", 1)[-1]
+            if raw_output.endswith("```"):
+                raw_output = raw_output.rsplit("\n", 1)[0]
+
+            logger.info(f"{tag} raw_output 길이: {len(raw_output)}자")
+
+            extracted_code = _extract_patched_code(raw_output)
+
+            if extracted_code:
+                logger.info(f"{tag} 추출된 patched_code ({len(extracted_code)}자):\n{extracted_code}")
+            else:
+                logger.warning(f"{tag} patched_code 추출 실패. raw_output 앞부분: {raw_output[:300]}")
+
+            return extracted_code
+
         except Exception as e:
             error_msg = str(e).lower()
-            logger.warning(f"{tag} API 호출 실패 (시도 {api_attempt + 1}/{max_api_retries}): {error_msg}")
-            
+            logger.warning(f"{tag} Gemini API 호출 실패 (시도 {api_attempt + 1}/{max_api_retries}): {error_msg}")
             if api_attempt == max_api_retries - 1:
                 logger.error(f"{tag} API 최대 재시도 횟수 초과. 코드 생성을 포기합니다.")
                 return ""
-            
-            if "429" in error_msg or "rate limit" in error_msg:
+            if "429" in error_msg or "rate limit" in error_msg or "resource" in error_msg:
                 wait_time = 5 * (api_attempt + 1)
                 logger.info(f"{tag} Rate Limit 감지. {wait_time}초 대기 후 재시도합니다...")
                 time.sleep(wait_time)
             else:
                 time.sleep(2)
 
-    choice = completion.choices[0]
-    logger.info(f"{tag} finish_reason={choice.finish_reason}")
-    if choice.finish_reason == "length":
-        logger.warning(f"{tag} Token length exceeded (finish_reason: length)")
-
-    message_content = choice.message.content
-    if not message_content:
-        reasoning_content = getattr(choice.message, 'reasoning', None)
-        if reasoning_content:
-            logger.warning(f"{tag} content가 비어 reasoning 필드를 대신 사용합니다.")
-            message_content = reasoning_content
-        else:
-            logger.warning(f"{tag} content, reasoning 모두 비어있어 빈 문자열 반환")
-            return ""
-
-    raw_output = message_content.strip()
-    if raw_output.startswith("```"):
-        raw_output = raw_output.split("\n", 1)[-1]
-    if raw_output.endswith("```"):
-        raw_output = raw_output.rsplit("\n", 1)[0]
-
-    logger.info(f"{tag} raw_output 길이: {len(raw_output)}자")
-
-    extracted_code = _extract_patched_code(raw_output)
-
-    # 로그 추가: 최종적으로 추출된 코드 전체를 확인 가능하게
-    if extracted_code:
-        logger.info(f"{tag} 추출된 patched_code ({len(extracted_code)}자):\n{extracted_code}")
-    else:
-        logger.warning(f"{tag} patched_code 추출 실패 (빈 문자열). raw_output 앞부분: {raw_output[:300]}")
-
-    return extracted_code
+    return ""
 
 logger = logging.getLogger(__name__)
 
@@ -445,6 +454,7 @@ def verify_patched_code(patched_code: str, original_code: str, language: str,
    * 예외 허용: 보안 취약점 해결을 위한 민감 정보 로그 삭제, 안전한 해시 함수로 교체, PreparedStatement 변경, 하드코딩 제거는 '로직 훼손'이 아닙니다. 정상적인 개선으로 판단하여 통과(Pass) 시키세요.
 
 [출력 형식]
+- 절대 마크다운 코드 블록(백틱)을 사용하지 마세요. 순수 JSON 텍스트만 출력하세요.
 - 실패 시 피드백("feedback")은 반드시 200자 이내로 핵심만 짧게 작성하세요.
 - 통과 시: {{"passed": true, "feedback": ""}}
 - 실패 시: {{"passed": false, "feedback": "어느 부분이 문제인지 구체적인 설명"}}
@@ -462,32 +472,28 @@ def verify_patched_code(patched_code: str, original_code: str, language: str,
     max_api_retries = 3
     for api_attempt in range(max_api_retries):
         try:
-            completion = client.chat.completions.create(
-                model="mistralai/mistral-nemotron",
-                messages=[
-                    {"role": "system", "content": system_prompt.strip()},
-                    {"role": "user", "content": user_prompt.strip()}
-                ],
-                temperature=0.0,
-                top_p=0.7,
-                max_tokens=4096,
-                timeout=45.0
+            response = gemini_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.0,
+                    max_output_tokens=4096,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
             )
 
-            choice = completion.choices[0]
-            logger.info(f"{tag} finish_reason={choice.finish_reason}")
+            finish_reason = response.candidates[0].finish_reason if response.candidates else None
+            logger.info(f"{tag} finish_reason={finish_reason}")
 
-            # 응답 추출 방어 로직
-            message_content = choice.message.content
-            if not message_content:
-                reasoning_content = getattr(choice.message, 'reasoning', None)
-                if reasoning_content:
-                    logger.warning(f"{tag} content가 비어 reasoning 필드를 대신 사용합니다.")
-                message_content = reasoning_content if reasoning_content else '{"passed": true, "feedback": ""}'
+            raw_output = response.text
+            if not raw_output:
+                logger.warning(f"{tag} response.text가 비어있음")
+                raw_output = '{"passed": true, "feedback": ""}'
 
-            raw_output = message_content.strip()
+            raw_output = raw_output.strip()
 
-            # 강력한 JSON 정제 로직
+            # 마크다운 제거
             cleaned = re.sub(r'```(?:json)?(.*?)```', r'\1', raw_output, flags=re.DOTALL).strip()
 
             start_idx = cleaned.find('{')
@@ -513,17 +519,16 @@ def verify_patched_code(patched_code: str, original_code: str, language: str,
                             f"feedback={parsed.get('feedback', '')[:200]}")
                 return parsed
             except json.JSONDecodeError:
-                logger.warning(f"{tag} [검증 파싱 실패] 원본 응답이 올바른 형식이 아닙니다: {raw_output[:100]}")
+                logger.warning(f"{tag} [검증 파싱 실패] 원본 응답: {raw_output[:100]}")
                 return {"passed": False, "feedback": "평가자 응답 파싱 실패 (JSON 포맷 에러). 코드를 다시 검증하세요."}
 
         except Exception as e:
             error_msg = str(e).lower()
             logger.warning(f"{tag} 검증기 API 호출 실패 (시도 {api_attempt + 1}/{max_api_retries}): {error_msg}")
 
-            is_overload = "503" in error_msg or "429" in error_msg or "resourceexhausted" in error_msg
+            is_overload = "503" in error_msg or "429" in error_msg or "resource" in error_msg
 
             if api_attempt == max_api_retries - 1:
-                # 최종 실패 — 하이브리드 판단
                 if is_overload:
                     logger.warning(f"{tag} 검증기 서버 과부하가 지속되어 검증을 생략하고 통과 처리합니다.")
                     return {"passed": True, "feedback": "(API 과부하로 문법 검증 생략됨)"}
@@ -554,7 +559,7 @@ def verify_issues_resolved(patched_code: str, original_code: str, vulnerabilitie
         return {
             "passed": False,
             "feedback": f"Semgrep 재검사 결과, 다음 취약점이 여전히 남아있습니다. 즉시 수정하세요:\n{remaining_issues}",
-            "resolved": ""   # 보안조차 아직 통과 못 했으니, 뭔가 "해결됐다"고 말할 게 없음
+            "resolved": ""
         }
 
     # 2. [기계 검증 2] Lizard로 복잡도가 실제로 줄었는지 체크 (리팩토링이 필요했던 경우에만)
@@ -568,11 +573,11 @@ def verify_issues_resolved(patched_code: str, original_code: str, vulnerabilitie
             return {
                 "passed": False,
                 "feedback": f"순환 복잡도가 여전히 {complexity_report['max_complexity']}로 너무 높습니다. 중첩 루프나 조건문을 제거하여 리팩토링하세요.",
-                "resolved": "보안 취약점은 성공적으로 패치되었습니다."   # 여긴 needs_refactoring이 True인 게 확실하니 그대로 둬도 됨(복잡도 얘기는 안 넣음, 이건 아직 실패 중이니까)
+                "resolved": "보안 취약점은 성공적으로 패치되었습니다."
             }
 
     # 3. [LLM 검증] 재사용 여부만 확인. duplicate_snippets 없으면 여기서 바로 통과
-    resolved_so_far = _build_resolved_summary(needs_refactoring)   # 실제 상황에 맞게 동적 생성
+    resolved_so_far = _build_resolved_summary(needs_refactoring)
 
     if not duplicate_snippets:
         logger.info(f"{tag} 재사용 대상 없음, Semgrep+Lizard 통과로 최종 승인")
@@ -597,6 +602,7 @@ def verify_issues_resolved(patched_code: str, original_code: str, vulnerabilitie
     - [반드시 재사용해야 할 기존 함수] 목록에 있는 각 함수가, [검토할 코드]에서
       실제로 import/호출되어 재사용되고 있는지 확인하세요.
     - 원본 로직을 그대로 복사해서 새로 정의한 경우(재사용 안 함)는 실패로 판단하세요.
+    - 절대 마크다운 코드 블록(백틱)을 사용하지 마세요. 순수 JSON 텍스트만 출력하세요.
 
     문제가 없으면 {{"passed": true, "feedback": "", "resolved": "재사용까지 포함해 모든 문제가 해결되었습니다."}}로 응답하세요.
     문제가 있으면 {{"passed": false, "feedback": "구체적으로 어떤 함수가 재사용되지 않았는지 설명", "resolved": "{resolved_so_far}"}}로 응답하세요.
@@ -614,35 +620,34 @@ def verify_issues_resolved(patched_code: str, original_code: str, vulnerabilitie
     """
 
     try:
-        completion = client.chat.completions.create(
-                model="mistralai/mistral-nemotron",
-                messages=[
-                    {"role": "system", "content": system_prompt.strip()},
-                    {"role": "user", "content": user_prompt.strip()}
-                ],
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=user_prompt.strip(),
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt.strip(),
                 temperature=0.0,
-                top_p=0.7,
-                max_tokens=4096,
-                timeout=45.0
+                max_output_tokens=4096,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
         )
 
-        choice = completion.choices[0]
-        logger.info(f"{tag} 재사용성 검증 API finish_reason={choice.finish_reason}")
+        finish_reason = response.candidates[0].finish_reason if response.candidates else None
+        logger.info(f"{tag} 재사용성 검증 API finish_reason={finish_reason}")
 
-        message_content = choice.message.content
-        if not message_content:
-            reasoning_content = getattr(choice.message, 'reasoning', None)
-            if reasoning_content:
-                logger.warning(f"{tag} content가 비어 reasoning 필드를 대신 사용합니다.")
-            message_content = reasoning_content if reasoning_content else ""
+        raw_output = response.text
+        if not raw_output:
+            logger.warning(f"{tag} response.text가 비어있음")
+            raw_output = ""
 
-        raw_output = message_content.strip()
+        raw_output = raw_output.strip()
+
+        # 마크다운 제거
+        cleaned = re.sub(r'```(?:json)?(.*?)```', r'\1', raw_output, flags=re.DOTALL).strip()
 
         try:
-            parsed = json.loads(raw_output, strict=False)
+            parsed = json.loads(cleaned, strict=False)
         except json.JSONDecodeError:
-            match = re.search(r'\{.*\}', raw_output, re.DOTALL)
-            # 파싱 실패 시에도, 실제로 어떤 검증을 거쳤는지에 맞는 문구를 씀 (하드코딩 아님)
+            match = re.search(r'\{.*\}', cleaned, re.DOTALL)
             parsed = json.loads(match.group(0), strict=False) if match else {
                 "passed": False, "feedback": "재사용성 검증 응답 파싱 실패.", "resolved": resolved_so_far
             }
@@ -664,20 +669,21 @@ def generate_patched_code(original_code, vulnerabilities, needs_refactoring=Fals
         error_history = []
         resolved_history = []
         best_code = None
+        previous_code = None   # 추가: 직전 시도의 코드를 추적
         is_success = False
         attempt = -1 
         
         for attempt in range(actual_retries):
             logger.info(f"====== [코드 생성] {attempt + 1}/{actual_retries}번째 시도 ======")
 
-            current_needs_refactoring = needs_refactoring if attempt < 2 else False
             current_duplicate_snippets = duplicate_snippets if attempt < 2 else None
             
             patched_code = draft_patched_code(
-                original_code, vulnerabilities, current_needs_refactoring,
+                original_code, vulnerabilities, needs_refactoring,
                 max_complexity, language, current_duplicate_snippets, 
                 error_history, resolved_history,
-                attempt_num=attempt + 1   # 추가
+                previous_code=previous_code,   
+                attempt_num=attempt + 1
             )
 
             if not patched_code:
@@ -696,11 +702,14 @@ def generate_patched_code(original_code, vulnerabilities, needs_refactoring=Fals
             if local_error_msg:
                 error_history.append(local_error_msg)
                 logger.warning(f"[{attempt + 1}차] 로컬 문법/리소스 검증 실패: {local_error_msg}")
+                # 괄호조차 안 맞는 코드는 다음 시도의 기준으로 삼지 않음 (previous_code 갱신 안 함)
                 continue
+
+            previous_code = patched_code   # 최소한 괄호는 맞는 코드부터 기준으로 삼음
 
             syntax_review = verify_patched_code(
                 patched_code, original_code, language,
-                attempt_num=attempt + 1   # 추가
+                attempt_num=attempt + 1
             )
             if not syntax_review.get("passed", True):
                 syntax_err = syntax_review.get("feedback", "알 수 없는 문법 오류")
@@ -713,7 +722,7 @@ def generate_patched_code(original_code, vulnerabilities, needs_refactoring=Fals
             issue_review = verify_issues_resolved(
                 patched_code, original_code, vulnerabilities,
                 needs_refactoring, max_complexity, duplicate_snippets, language,
-                attempt_num=attempt + 1   # 추가
+                attempt_num=attempt + 1
             )
             
             if issue_review.get("passed", True):
@@ -737,7 +746,6 @@ def generate_patched_code(original_code, vulnerabilities, needs_refactoring=Fals
             
         elapsed_time = round(time.time() - start_time, 2)
 
-        # 로그 추가: 최종적으로 반환되는 코드를 한 번에 확인 가능하게
         final_code_preview = best_code if best_code else "보완 코드 생성에 실패했습니다."
         logger.info(f"====== [코드 생성] 최종 결과: status={'success' if is_success else 'fail'}, "
                     f"attempts_used={attempt + 1}, elapsed={elapsed_time}초 ======")
