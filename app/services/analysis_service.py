@@ -1238,6 +1238,10 @@ async def detect_ai_code(request: AICodeDetectionRequest) -> AICodeDetectionResp
         if isinstance(patch_result, dict):
             final_code = patch_result.get("final_code", "보완 코드 생성에 실패했습니다.")
             patch_success = (patch_result.get("status") == "success")
+        elif patch_result is None:
+            # 취약점/복잡도/중복 문제가 없어 패치 자체가 필요 없었던 정상 케이스
+            final_code = code
+            patch_success = True
         else:
             final_code = patch_result
             patch_success = bool(final_code) and final_code != "보완 코드 생성에 실패했습니다."
