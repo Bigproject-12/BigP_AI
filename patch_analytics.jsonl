@@ -17,3 +17,6 @@
 {"timestamp": 1786084235.7265594, "language": "JAVA", "vulnerability_count": 9, "status": "success", "attempts": 1, "elapsed_seconds": 34.38}
 {"timestamp": 1786084354.1367657, "language": "JAVA", "vulnerability_count": 9, "status": "success", "attempts": 1, "elapsed_seconds": 35.54}
 {"timestamp": 1786085682.674769, "language": "JAVA", "vulnerability_count": 9, "status": "success", "attempts": 2, "elapsed_seconds": 15.78}
+{"timestamp": 1786408565.1721013, "language": "PY", "vulnerability_count": 3, "status": "success", "attempts": 1, "elapsed_seconds": 10.14}
+{"timestamp": 1786425541.491616, "language": "C", "vulnerability_count": 3, "status": "success", "attempts": 3, "elapsed_seconds": 31.58}
+{"timestamp": 1786452191.6236067, "language": "JAVA", "vulnerability_count": 4, "status": "success", "attempts": 1, "elapsed_seconds": 11.83}
