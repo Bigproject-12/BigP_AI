@@ -229,7 +229,7 @@ def index_repo_files(repo_id: int, files: list[dict]) -> list[dict]:
     return metadata_result
 
 
-def search_similar_code(repo_id: int, code: str, language: str = "java", top_k: int = 5, threshold: float = 0.7) -> list[dict]:
+def search_similar_code(repo_id: int, code: str, language: str = "java", top_k: int = 5, threshold: float = 0.85) -> list[dict]:
     path = _index_path(repo_id)
     if not os.path.exists(path):
         print(f"[TRACE] 인덱스 파일 없음: {path}")
