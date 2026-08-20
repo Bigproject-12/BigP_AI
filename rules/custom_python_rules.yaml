@@ -1,0 +1,100 @@
+rules:
+  - id: guardrail-python-sqli-dynamic-execute
+    languages: [python]
+    severity: ERROR
+    message: >
+      SQL query is executed via cursor.execute() with a dynamically built string,
+      not a hardcoded literal. This may lead to SQL Injection. Use parameterized
+      queries instead (e.g. cursor.execute(query, (param,))).
+    patterns:
+      - pattern: $CURSOR.execute($QUERY)
+      - pattern-not: $CURSOR.execute("...")
+      - pattern-not: $CURSOR.execute("...", ...)
+      - pattern-not: $CURSOR.execute()
+    metadata:
+      category: security
+      cwe: "CWE-89: SQL Injection"
+      owasp: "A03:2021 - Injection"
+
+  - id: guardrail-python-hardcoded-secret
+    languages: [python]
+    severity: ERROR
+    message: >
+      Sensitive value appears to be hardcoded as a string literal, either directly
+      or as a fallback default when an environment variable is missing. Even a
+      fallback value is a security risk - if the environment variable is not set,
+      the application will silently use this weak default instead of failing fast.
+      Load this value from an environment variable or secret manager, and throw
+      an exception if it is missing, instead of falling back to a literal.
+    patterns:
+      - pattern-either:
+          - pattern: $NAME = "..."
+          - pattern: $NAME = os.environ.get("...", "...")
+          - pattern: $NAME = os.getenv("...", "...")
+          - pattern: $NAME = os.getenv("...") or "..."
+          - pattern: $NAME = os.environ.get("...") or "..."
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(secret|password|api_key|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+
+  - id: guardrail-python-command-injection
+    languages: [python]
+    severity: ERROR
+    message: >
+      subprocess is called with shell=True and a dynamically built command string.
+      This may lead to Command Injection. Use a list of arguments with shell=False instead.
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.run($CMD, shell=True, ...)
+          - pattern: subprocess.call($CMD, shell=True, ...)
+          - pattern: subprocess.Popen($CMD, shell=True, ...)
+      - pattern-not: subprocess.run("...", shell=True, ...)
+      - pattern-not: subprocess.call("...", shell=True, ...)
+      - pattern-not: subprocess.Popen("...", shell=True, ...)
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+      owasp: "A03:2021 - Injection"
+
+  - id: guardrail-python-sensitive-log
+    languages: [python]
+    severity: ERROR
+    message: >
+      A variable whose name suggests sensitive information (password, secret, token)
+      is being printed or logged directly. This can leak credentials into log files.
+    patterns:
+      - pattern-either:
+          - pattern: print("...", $VAR)
+          - pattern: print($VAR)
+          - pattern: print(f"...{$VAR}...")
+      - pattern-not: print("...", $FUNC(...))
+      - pattern-not: print($FUNC(...))
+      - pattern-not: print(f"...{$FUNC(...)}...")
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i).*(password|secret|token|credential).*
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
+
+  - id: guardrail-python-sensitive-log-via-function
+    languages: [python]
+    severity: ERROR
+    message: >
+      A function whose name suggests it returns sensitive information (get_password,
+      get_secret, etc.) is being printed or logged directly.
+    patterns:
+      - pattern-either:
+          - pattern: print("...", $FUNC(...))
+          - pattern: print($FUNC(...))
+          - pattern: print(f"...{$FUNC(...)}...")
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: (?i).*(get_?password|get_?secret|get_?token|get_?credential).*
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"

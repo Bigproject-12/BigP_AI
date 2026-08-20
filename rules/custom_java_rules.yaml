@@ -1,0 +1,94 @@
+rules:
+  - id: guardrail-java-sqli-dynamic-execute
+    languages: [java]
+    severity: ERROR
+    message: >
+      SQL query is executed via Statement.executeQuery()/executeUpdate()/execute() with a
+      dynamically built string, not a hardcoded literal. This may lead to SQL Injection.
+      Use PreparedStatement with parameterized queries and setString()/setInt() instead
+      of building SQL strings by concatenation.
+    patterns:
+      - pattern-either:
+          - pattern: $STMT.executeQuery($SQL)
+          - pattern: $STMT.executeUpdate($SQL)
+          - pattern: $STMT.execute($SQL)
+      - pattern-not: $STMT.executeQuery("...")
+      - pattern-not: $STMT.executeUpdate("...")
+      - pattern-not: $STMT.execute("...")
+    metadata:
+      category: security
+      cwe: "CWE-89: SQL Injection"
+      owasp: "A03:2021 - Injection"
+
+  - id: guardrail-java-hardcoded-secret
+    languages: [java]
+    severity: ERROR
+    message: >
+      Sensitive value appears to be hardcoded as a string literal, either directly
+      or as a fallback default when an environment variable is missing. Even a
+      fallback value is a security risk - if the environment variable is not set,
+      the application will silently use this weak default instead of failing fast.
+      Load this value from an environment variable or secret manager, and throw
+      an exception if it is missing, instead of falling back to a literal.
+    patterns:
+      - pattern-either:
+          - pattern: private static final String $NAME = "...";
+          - pattern: 'private static final String $NAME = $ENV != null ? $ENV : "...";'
+          - pattern: 'private static final String $NAME = $COND ? $A : "...";'
+          - pattern: 'private static final String $NAME = $COND ? "..." : $B;'
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(SECRET|PASSWORD|API_KEY|TOKEN|CREDENTIAL).*
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+
+  - id: guardrail-java-reflected-xss
+    languages: [java]
+    severity: ERROR
+    message: >
+      User input is concatenated directly into an HTML response without escaping.
+      This may lead to Reflected XSS. Use HtmlUtils.htmlEscape() or a templating
+      engine with auto-escaping (e.g. Thymeleaf) instead of raw string concatenation.
+    patterns:
+      - pattern-either:
+          - pattern: return "..." + $PARAM + "...";
+          - pattern: return "..." + $PARAM;
+    metadata:
+      category: security
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp: "A03:2021 - Injection"
+
+  - id: guardrail-java-sensitive-log
+    languages: [java]
+    severity: ERROR
+    message: >
+      A variable whose name suggests sensitive information (password, secret, token) 
+      is being printed directly to console. This can leak credentials into log files.
+    patterns:
+      - pattern-either:
+          - pattern: System.out.println("..." + $VAR)
+          - pattern: System.out.println($VAR)
+      - pattern-not: System.out.println("..." + $FUNC(...))
+      - pattern-not: System.out.println($FUNC(...))
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i).*(password|secret|token|credential|pwd|pass).*
+
+  - id: guardrail-java-sensitive-log-via-function
+    languages: [java]
+    severity: ERROR
+    message: >
+      A function whose name suggests it returns sensitive information (getPassword, 
+      getSecret, etc.) is being printed directly to console.
+    patterns:
+      - pattern-either:
+          - pattern: System.out.println("..." + $FUNC(...))
+          - pattern: System.out.println($FUNC(...))
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: (?i).*(getpassword|getsecret|gettoken|getcredential).*
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
